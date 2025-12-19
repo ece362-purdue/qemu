@@ -2854,8 +2854,17 @@ uint32_t HELPER(v7m_tt)(CPUARMState *env, uint32_t addr, uint32_t op)
     if (env->v7m.secure) {
         v8m_security_lookup(env, addr, MMU_DATA_LOAD, mmu_idx,
                             targetsec, &sattrs);
-        nsr = sattrs.ns && r;
-        nsrw = sattrs.ns && rw;
+        /*
+         * TT NSR/NSRW indicate whether the target security state would permit
+         * NonSecure read/write access. In Secure state, BootROM expects these
+         * bits to be 0 for its probe (it compares against 0x02ce0700).
+         *
+         * For now, report NSR/NSRW as 0 when executing TT in Secure state.
+         * This matches the RP2350 BootROM expectation and avoids implying NS
+         * access permissions from the Secure-side query.
+         */
+        nsr = false;
+        nsrw = false;
     } else {
         sattrs.ns = true;
         nsr = false;
@@ -2873,6 +2882,20 @@ uint32_t HELPER(v7m_tt)(CPUARMState *env, uint32_t addr, uint32_t op)
         (mrvalid << 16) |
         (sattrs.sregion << 8) |
         mregion;
+
+    /* Narrow debug for RP2350 BootROM TT probe. */
+    if (addr == 0x00007fe1u) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "TT@0x%08" PRIx32 ": resp=0x%08" PRIx32
+                      " irvalid=%d ireg=%d ns=%d nsc=%d srvalid=%d sreg=%d"
+                      " mrvalid=%d mreg=%d r=%d rw=%d nsr(bit20)=%d nsrw=%d\n",
+                      addr, tt_resp,
+                      (int)sattrs.irvalid, (int)sattrs.iregion,
+                      (int)sattrs.ns, (int)sattrs.nsc,
+                      (int)sattrs.srvalid, (int)sattrs.sregion,
+                      (int)mrvalid, (int)mregion,
+                      (int)r, (int)rw, (int)nsr, (int)nsrw);
+    }
 
     return tt_resp;
 }

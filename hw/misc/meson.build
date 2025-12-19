@@ -120,6 +120,9 @@ system_ss.add(when: 'CONFIG_MPS2_SCC', if_true: files('mps2-scc.c'))
 
 system_ss.add(when: 'CONFIG_TZ_MPC', if_true: files('tz-mpc.c'))
 system_ss.add(when: 'CONFIG_TZ_MSC', if_true: files('tz-msc.c'))
+
+# RP2350 (minimal) Armv8-M IDAU for BootROM bring-up
+system_ss.add(files('rp2350-idau.c'))
 system_ss.add(when: 'CONFIG_TZ_PPC', if_true: files('tz-ppc.c'))
 system_ss.add(when: 'CONFIG_IOTKIT_SECCTL', if_true: files('iotkit-secctl.c'))
 system_ss.add(when: 'CONFIG_IOTKIT_SYSCTL', if_true: files('iotkit-sysctl.c'))

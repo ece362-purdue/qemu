@@ -1967,7 +1967,7 @@ static void nvic_writel(NVICState *s, uint32_t offset, uint32_t value,
         if (!attrs.secure) {
             return;
         }
-        cpu->env.sau.ctrl = value & 3;
+    cpu->env.sau.ctrl = value & 3;
         break;
     case 0xdd4: /* SAU_TYPE */
         if (!arm_feature(&cpu->env, ARM_FEATURE_V8)) {
@@ -2002,7 +2002,7 @@ static void nvic_writel(NVICState *s, uint32_t offset, uint32_t value,
         if (region >= cpu->sau_sregion) {
             return;
         }
-        cpu->env.sau.rbar[region] = value & ~0x1f;
+    cpu->env.sau.rbar[region] = value & ~0x1f;
         tlb_flush(CPU(cpu));
         break;
     }
@@ -2019,7 +2019,11 @@ static void nvic_writel(NVICState *s, uint32_t offset, uint32_t value,
         if (region >= cpu->sau_sregion) {
             return;
         }
-        cpu->env.sau.rlar[region] = value & ~0x1c;
+    /*
+     * SAU_RLAR: bits[1:0] are control (NSC/ENABLE), bits[4:2] are RES0.
+     * Preserve the control bits; clear only architectural RES0.
+     */
+    cpu->env.sau.rlar[region] = value & ~0x1c;
         tlb_flush(CPU(cpu));
         break;
     }
