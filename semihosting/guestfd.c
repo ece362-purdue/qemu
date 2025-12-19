@@ -22,7 +22,6 @@ void qemu_semihosting_guestfd_init(void)
 
     if (semihosting_arm_compatible()) {
         semihosting_arm_compatible_init();
-        return;
     }
 
     /* Out of ARM, the stdio file descriptors apply. */

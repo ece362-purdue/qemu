@@ -186,6 +186,14 @@ config REALVIEW
     select DS1338 # I2C RTC+NVRAM
     select USB_OHCI_SYSBUS
 
+config RP2350
+    bool
+    default y
+    select ARM_V7M  # Cortex-M33 is v8-M, but this pulls in the necessary M-profile logic
+    select PL011    # The UART used by Pico
+    select OR_IRQ   # Useful for combining interrupts
+    select UNIMP    # For mapping "Unimplemented" peripheral holes
+
 config SBSA_REF
     bool
     default y
