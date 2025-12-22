@@ -41,6 +41,11 @@
 #define RP2350_BOOTRAM_BASE     0x400e0000
 #define RP2350_BOOTRAM_SIZE     (1 * KiB)  /* 0x400e0000 - 0x400e0400 */
 
+/* USB DPRAM - used by bootrom as stack during NS code execution */
+#define RP2350_USBDPRAM_NS_BASE  0x40100000
+#define RP2350_USBDPRAM_S_BASE   0x50100000
+#define RP2350_USBDPRAM_SIZE     (4 * KiB)
+
 #define RP2350_UART0_BASE       0x40070000
 #define RP2350_UART0_IRQ        33
 
@@ -237,6 +242,8 @@ struct RP2350State {
     MemoryRegion sram;
     MemoryRegion bootram;
     MemoryRegion flash_alias; 
+    MemoryRegion usbdpram;
+    MemoryRegion usbdpram_s_alias;
 
     RP2350FIFOState fifo;
     /* Per-core board memory view (aliases system memory) for ARMv7M devices */
@@ -251,6 +258,9 @@ struct RP2350State {
     /* Minimal PLL peripherals */
     MemoryRegion pll_sys;
     MemoryRegion pll_usb;
+
+    /* Minimal POWMAN peripheral */
+    MemoryRegion powman;
 };
 
 /* Minimal RESETS peripheral - always reports all peripherals out of reset */
@@ -310,6 +320,9 @@ static const MemoryRegionOps rp2350_xosc_ops = {
 #define RP2350_PLL_USB_BASE     0x40058000
 #define RP2350_PLL_SIZE         0x1000
 
+#define RP2350_POWMAN_BASE      0x400d0000
+#define RP2350_POWMAN_SIZE      0x1000
+
 static uint64_t rp2350_pll_read(void *opaque, hwaddr offset, unsigned size) {
     switch (offset) {
     case 0x00: /* CS */
@@ -326,6 +339,26 @@ static void rp2350_pll_write(void *opaque, hwaddr offset, uint64_t value, unsign
 static const MemoryRegionOps rp2350_pll_ops = {
     .read = rp2350_pll_read,
     .write = rp2350_pll_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
+/* Minimal POWMAN peripheral - power manager */
+static uint64_t rp2350_powman_read(void *opaque, hwaddr offset, unsigned size) {
+    switch (offset) {
+    case 0x00: /* STATE - bit 16 = power good/ready */
+        return 0x00010000; /* Power is good */
+    default:
+        return 0;
+    }
+}
+
+static void rp2350_powman_write(void *opaque, hwaddr offset, uint64_t value, unsigned size) {
+    /* Ignore writes */
+}
+
+static const MemoryRegionOps rp2350_powman_ops = {
+    .read = rp2350_powman_read,
+    .write = rp2350_powman_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
@@ -356,6 +389,14 @@ static void rp2350_init(MachineState *machine)
     memory_region_init_ram(&s->bootram, NULL, "rp2350.bootram", RP2350_BOOTRAM_SIZE, &error_fatal);
     memory_region_add_subregion(get_system_memory(), RP2350_BOOTRAM_BASE, &s->bootram);
 
+    /* USB DPRAM - used by bootrom as stack during NS code execution */
+    memory_region_init_ram(&s->usbdpram, NULL, "rp2350.usbdpram", RP2350_USBDPRAM_SIZE, &error_fatal);
+    memory_region_add_subregion(get_system_memory(), RP2350_USBDPRAM_NS_BASE, &s->usbdpram);
+    /* Secure alias of USB DPRAM */
+    memory_region_init_alias(&s->usbdpram_s_alias, NULL, "rp2350.usbdpram.s",
+                             &s->usbdpram, 0, RP2350_USBDPRAM_SIZE);
+    memory_region_add_subregion(get_system_memory(), RP2350_USBDPRAM_S_BASE, &s->usbdpram_s_alias);
+
     /* Minimal RESETS peripheral */
     memory_region_init_io(&s->resets, NULL, &rp2350_resets_ops, s,
                           "rp2350.resets", RP2350_RESETS_SIZE);
@@ -374,6 +415,11 @@ static void rp2350_init(MachineState *machine)
     memory_region_init_io(&s->pll_usb, NULL, &rp2350_pll_ops, s,
                           "rp2350.pll_usb", RP2350_PLL_SIZE);
     memory_region_add_subregion(get_system_memory(), RP2350_PLL_USB_BASE, &s->pll_usb);
+
+    /* Minimal POWMAN peripheral */
+    memory_region_init_io(&s->powman, NULL, &rp2350_powman_ops, s,
+                          "rp2350.powman", RP2350_POWMAN_SIZE);
+    memory_region_add_subregion(get_system_memory(), RP2350_POWMAN_BASE, &s->powman);
 
     memory_region_init_rom(&s->flash, NULL, "rp2350.flash", RP2350_FLASH_SIZE, &error_fatal);
     memory_region_add_subregion(get_system_memory(), RP2350_FLASH_BASE, &s->flash);

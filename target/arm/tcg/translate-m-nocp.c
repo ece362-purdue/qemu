@@ -747,8 +747,13 @@ static bool trans_NOCP(DisasContext *s, arg_nocp *a)
      * used for security hardening. We don't implement RCP functionality,
      * but we allow the instructions to execute as NOPs rather than faulting,
      * so that BootROM code using RCP canaries/step-counts can proceed.
+     *
+     * RP2350 also has:
+     * - Coprocessor 0: DCP (Double-precision Coprocessor)
+     * - Coprocessor 1: DCP alias
+     * These are also treated as NOPs for now.
      */
-    if (a->cp == 7) {
+    if (a->cp == 7 || a->cp == 0 || a->cp == 1) {
         return true;  /* NOP - instruction handled, do nothing */
     }
 

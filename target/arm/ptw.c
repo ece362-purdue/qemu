@@ -3132,8 +3132,6 @@ void v8m_security_lookup(CPUARMState *env, uint32_t address,
             sattrs->nsc = idau_nsc;
         }
     }
-
-    /* no RP2350-specific quirks here */
 }
 
 static bool get_phys_addr_pmsav8(CPUARMState *env,

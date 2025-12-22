@@ -582,10 +582,16 @@ void HELPER(v7m_bxns)(CPUARMState *env, uint32_t dest)
     /* translate.c should have made BXNS UNDEF unless we're secure */
     assert(env->v7m.secure);
 
+    fprintf(stderr, "BXNS: dest=0x%08x, before switch: SP=0x%08x, other_ss_msp=0x%08x, other_ss_psp=0x%08x, using_psp=%d\n",
+            dest, env->regs[13], env->v7m.other_ss_msp, env->v7m.other_ss_psp, v7m_using_psp(env));
+
     if (!(dest & 1)) {
         env->v7m.control[M_REG_S] &= ~R_V7M_CONTROL_SFPA_MASK;
     }
     switch_v7m_security_state(env, dest & 1);
+
+    fprintf(stderr, "BXNS: after switch: SP=0x%08x, secure=%d\n", env->regs[13], env->v7m.secure);
+
     env->thumb = true;
     env->regs[15] = dest & ~1;
     arm_rebuild_hflags(env);

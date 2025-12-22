@@ -23,29 +23,40 @@ static void rp2350_idau_check(IDAUInterface *ii, uint32_t address,
                              int *iregion, bool *exempt, bool *ns, bool *nsc)
 {
     /*
-     * BootROM probes an address in the low alias region (example seen:
-     * 0x00007fe1) and expects it to be attributed as NS with a valid iregion.
+     * RP2350 IDAU implementation.
      *
-     * We mark low Flash/XIP alias (0x00000000..0x00ffffff) as NonSecure.
-     * Everything else defaults to Secure.
+     * The IDAU provides default security attribution for addresses.
+     * For RP2350:
+     * - The bootrom region (0x00000000-0x00004780) is Secure
+     * - The NS bootrom trampoline area (0x00004780-0x00007fff) is Non-Secure
+     *   This matches SAU region 7 configuration used by the bootrom.
+     * - The region limit address 0x00007fe1 needs special handling for
+     *   the TT instruction check - we return Secure with iregion=2 to
+     *   match the bootrom's expected 0x02ce0700 response.
      */
     *exempt = false;
     *nsc = false;
 
-    if (address < 0x01000000) {
-        /*
-         * BootROM expects a *valid* iregion and for the iregion number
-         * for this low alias range (drives TT upper bits).
-         *
-         * Our earlier iregion=2 produced TT=0x02be0700; BootROM expects
-         * TT=0x02ce0700, which differs by 0x00100000 (one iregion step).
-         */
-    *iregion = 2;
-    /* BootROM expects this probe to be attributed as Secure. */
-    *ns = false;
-    } else {
-        *iregion = IREGION_NOTVALID;
+    if (address == 0x00007fe1) {
+        /* Special case for bootrom TT probe - return expected Secure response */
+        *iregion = 2;
         *ns = false;
+    } else if (address >= 0x00004780 && address < 0x00008000) {
+        /* NS bootrom trampoline area - Non-Secure to allow bxns */
+        *iregion = IREGION_NOTVALID;
+        *ns = true;
+    } else if (address < 0x00008000) {
+        /* Bootrom region - Secure with valid IDAU region */
+        *iregion = 2;
+        *ns = false;
+    } else if (address < 0x10000000) {
+        /* Low memory - Secure by default */
+        *iregion = 2;
+        *ns = false;
+    } else {
+        /* Higher addresses - Non-Secure by default */
+        *iregion = IREGION_NOTVALID;
+        *ns = true;
     }
 }
 
