@@ -997,6 +997,8 @@ static uint32_t nvic_readl(NVICState *s, uint32_t offset, MemTxAttrs attrs)
             goto bad_offset;
         }
         return ((s->num_irq - NVIC_FIRST_IRQ) / 32) - 1;
+    case 0x8: /* ACTLR - Auxiliary Control Register (IMPDEF, RAZ/WI) */
+        return 0;
     case 0xc: /* CPPWR */
         if (!arm_feature(&cpu->env, ARM_FEATURE_V8)) {
             goto bad_offset;
@@ -1562,6 +1564,9 @@ static void nvic_writel(NVICState *s, uint32_t offset, uint32_t value,
     ARMCPU *cpu = s->cpu;
 
     switch (offset) {
+    case 0x8: /* ACTLR - Auxiliary Control Register (IMPDEF, RAZ/WI) */
+        /* Make the IMPDEF choice to RAZ/WI this. */
+        break;
     case 0xc: /* CPPWR */
         if (!arm_feature(&cpu->env, ARM_FEATURE_V8)) {
             goto bad_offset;
