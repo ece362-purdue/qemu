@@ -53,6 +53,14 @@ static void rp2350_idau_check(IDAUInterface *ii, uint32_t address,
         /* Low memory - Secure by default */
         *iregion = 2;
         *ns = false;
+    } else if (address < 0x20000000) {
+        /* XIP Flash region (0x10000000 - 0x1FFFFFFF) - Secure for bare-metal boot */
+        *iregion = 2;
+        *ns = false;
+    } else if (address >= 0x20000000 && address < 0x20082000) {
+        /* SRAM region - Secure for bare-metal boot */
+        *iregion = 2;
+        *ns = false;
     } else {
         /* Higher addresses - Non-Secure by default */
         *iregion = IREGION_NOTVALID;

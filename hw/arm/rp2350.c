@@ -789,7 +789,13 @@ static const MemoryRegionOps rp2350_powman_ops = {
 /* ========== TIMER - Microsecond Timer ========== */
 #define RP2350_TIMER0_BASE      0x400b0000
 #define RP2350_TIMER1_BASE      0x400b8000
-#define RP2350_TIMER_SIZE       0x1000
+#define RP2350_TIMER_SIZE       0x4000  /* Include atomic aliases: normal, SET, CLR, XOR */
+
+/* Atomic alias offsets for RP2350 peripherals */
+#define ATOMIC_NORMAL   0x0000
+#define ATOMIC_SET      0x1000
+#define ATOMIC_CLR      0x2000
+#define ATOMIC_XOR      0x3000
 
 /* Timer register offsets */
 #define TIMER_TIMEHW        0x00
@@ -826,7 +832,10 @@ static uint64_t rp2350_timer_read(void *opaque, hwaddr offset, unsigned size)
     uint64_t time_us;
     uint32_t val = 0;
 
-    switch (offset) {
+    /* Strip atomic alias bits - reads return same value regardless of alias */
+    hwaddr reg_offset = offset & 0xFFF;
+
+    switch (reg_offset) {
     case TIMER_TIMEHR:
         /* Reading TIMEHR latches TIMELR, return high 32 bits */
         time_us = timer_get_time_us(s);
@@ -880,26 +889,40 @@ static void rp2350_timer_write(void *opaque, hwaddr offset, uint64_t val,
 {
     RP2350TimerState *s = opaque;
 
-    switch (offset) {
+    /* Determine atomic operation type from address bits [13:12] */
+    int atomic_op = (offset >> 12) & 0x3;
+    hwaddr reg_offset = offset & 0xFFF;
+
+    /* Helper macro for atomic operations on a register */
+    #define ATOMIC_WRITE(reg, newval) do { \
+        switch (atomic_op) { \
+        case 0: (reg) = (newval); break;       /* Normal write */ \
+        case 1: (reg) |= (newval); break;      /* SET */ \
+        case 2: (reg) &= ~(newval); break;     /* CLR */ \
+        case 3: (reg) ^= (newval); break;      /* XOR */ \
+        } \
+    } while(0)
+
+    switch (reg_offset) {
     case TIMER_ALARM0:
     case TIMER_ALARM1:
     case TIMER_ALARM2:
     case TIMER_ALARM3:
-        s->alarm[(offset - TIMER_ALARM0) / 4] = val;
-        s->armed |= (1 << ((offset - TIMER_ALARM0) / 4));
+        ATOMIC_WRITE(s->alarm[(reg_offset - TIMER_ALARM0) / 4], val);
+        s->armed |= (1 << ((reg_offset - TIMER_ALARM0) / 4));
         break;
     case TIMER_ARMED:
         /* Writing 1 disarms the alarm */
         s->armed &= ~val;
         break;
     case TIMER_PAUSE:
-        s->pause = val & 1;
+        ATOMIC_WRITE(s->pause, val & 1);
         break;
     case TIMER_INTE:
-        s->inte = val & 0xf;
+        ATOMIC_WRITE(s->inte, val & 0xf);
         break;
     case TIMER_INTF:
-        s->intf = val & 0xf;
+        ATOMIC_WRITE(s->intf, val & 0xf);
         break;
     case TIMER_INTR:
         /* Write to clear interrupts */
@@ -908,6 +931,8 @@ static void rp2350_timer_write(void *opaque, hwaddr offset, uint64_t val,
     default:
         break;
     }
+
+    #undef ATOMIC_WRITE
 }
 
 static const MemoryRegionOps rp2350_timer_ops = {
@@ -1037,8 +1062,17 @@ static void rp2350_init(MachineState *machine)
         /* Connect Clock to CPU */
         qdev_connect_clock_in(DEVICE(&s->cpu[n]), "cpuclk", sysclk);
 
-        /* Core 1 starts halted */
-        if (n == 1) {
+        /* 
+         * Set initial vector table address for Cortex-M33 TrustZone.
+         * Without bootrom, firmware loads directly at 0x10000000 (XIP flash).
+         * Core 0 boots from there; Core 1 VTOR is set via SIO FIFO during launch.
+         */
+        if (n == 0) {
+            /* Core 0: Vector table at flash base (where firmware.elf is loaded) */
+            qdev_prop_set_uint32(DEVICE(&s->cpu[n]), "init-svtor", RP2350_FLASH_BASE);
+            qdev_prop_set_uint32(DEVICE(&s->cpu[n]), "init-nsvtor", RP2350_FLASH_BASE);
+        } else {
+            /* Core 1: Starts halted, VTOR set via SIO FIFO during launch */
             qdev_prop_set_bit(DEVICE(&s->cpu[n]), "start-powered-off", true);
         }
 
