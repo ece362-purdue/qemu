@@ -742,6 +742,16 @@ static bool trans_NOCP(DisasContext *s, arg_nocp *a)
         a->cp = 10;
     }
 
+    /*
+     * RP2350/Cortex-M33: Coprocessor 7 is the RCP (Redundancy Coprocessor)
+     * used for security hardening. We don't implement RCP functionality,
+     * but we allow the instructions to execute as NOPs rather than faulting,
+     * so that BootROM code using RCP canaries/step-counts can proceed.
+     */
+    if (a->cp == 7) {
+        return true;  /* NOP - instruction handled, do nothing */
+    }
+
     if (a->cp != 10) {
         gen_exception_insn(s, 0, EXCP_NOCP, syn_uncategorized());
         return true;

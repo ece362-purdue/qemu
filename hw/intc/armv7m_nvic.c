@@ -1406,7 +1406,12 @@ static uint32_t nvic_readl(NVICState *s, uint32_t offset, MemTxAttrs attrs)
             if (region >= cpu->pmsav7_dregion) {
                 return 0;
             }
-            return cpu->env.pmsav8.rlar[attrs.secure][region];
+            /*
+             * PMSAv8-M MPU_RLAR: bit[4] is RES0 and must read as zero.
+             * Some firmware (e.g. RP2350 BootROM) writes bit[4] as part of
+             * AttrIndx but expects it to read back as zero.
+             */
+            return cpu->env.pmsav8.rlar[attrs.secure][region] & ~0x10;
         }
 
         if (region >= cpu->pmsav7_dregion) {
@@ -1842,6 +1847,15 @@ static void nvic_writel(NVICState *s, uint32_t offset, uint32_t value,
         tlb_flush(CPU(cpu));
         break;
     case 0xd98: /* MPU_RNR */
+        /*
+         * PMSAv8-M MPU_RNR: only the bottom bits (typically 3 or 4) select
+         * the region. Upper bits are RES0 and should be ignored on write.
+         * Mask to valid region bits before range checking.
+         */
+        if (arm_feature(&cpu->env, ARM_FEATURE_V8)) {
+            /* Most Cortex-M33 implementations have 8 or 16 regions */
+            value &= 0xf;
+        }
         if (value >= cpu->pmsav7_dregion) {
             qemu_log_mask(LOG_GUEST_ERROR, "MPU region out of range %"
                           PRIu32 "/%" PRIu32 "\n",
