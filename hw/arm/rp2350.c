@@ -38,6 +38,9 @@
 #define RP2350_SRAM_BASE        0x20000000
 #define RP2350_SRAM_SIZE        (520 * KiB)
 
+#define RP2350_BOOTRAM_BASE     0x400e0000
+#define RP2350_BOOTRAM_SIZE     (1 * KiB)  /* 0x400e0000 - 0x400e0400 */
+
 #define RP2350_UART0_BASE       0x40070000
 #define RP2350_UART0_IRQ        33
 
@@ -232,11 +235,98 @@ struct RP2350State {
     MemoryRegion bootrom;
     MemoryRegion flash;
     MemoryRegion sram;
+    MemoryRegion bootram;
     MemoryRegion flash_alias; 
 
     RP2350FIFOState fifo;
     /* Per-core board memory view (aliases system memory) for ARMv7M devices */
     MemoryRegion board_mem[RP2350_CPUS];
+
+    /* Minimal RESETS peripheral */
+    MemoryRegion resets;
+
+    /* Minimal XOSC peripheral */
+    MemoryRegion xosc;
+
+    /* Minimal PLL peripherals */
+    MemoryRegion pll_sys;
+    MemoryRegion pll_usb;
+};
+
+/* Minimal RESETS peripheral - always reports all peripherals out of reset */
+#define RP2350_RESETS_BASE      0x40020000
+#define RP2350_RESETS_SIZE      0x1000
+
+static uint64_t rp2350_resets_read(void *opaque, hwaddr offset, unsigned size) {
+    switch (offset) {
+    case 0x00: /* RESET */
+        return 0; /* All resets deasserted */
+    case 0x04: /* WDSEL */
+        return 0;
+    case 0x08: /* RESET_DONE */
+        return 0x1fffffff; /* All peripherals out of reset */
+    default:
+        return 0;
+    }
+}
+
+static void rp2350_resets_write(void *opaque, hwaddr offset, uint64_t value, unsigned size) {
+    /* Ignore all writes - we pretend peripherals are always ready */
+}
+
+static const MemoryRegionOps rp2350_resets_ops = {
+    .read = rp2350_resets_read,
+    .write = rp2350_resets_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
+/* Minimal XOSC peripheral - always reports stable */
+#define RP2350_XOSC_BASE        0x40048000
+#define RP2350_XOSC_SIZE        0x1000
+
+static uint64_t rp2350_xosc_read(void *opaque, hwaddr offset, unsigned size) {
+    switch (offset) {
+    case 0x00: /* CTRL */
+        return 0x00fab000; /* Enabled */
+    case 0x04: /* STATUS */
+        return 0x80001000; /* STABLE=1, ENABLED=1 */
+    default:
+        return 0;
+    }
+}
+
+static void rp2350_xosc_write(void *opaque, hwaddr offset, uint64_t value, unsigned size) {
+    /* Ignore writes */
+}
+
+static const MemoryRegionOps rp2350_xosc_ops = {
+    .read = rp2350_xosc_read,
+    .write = rp2350_xosc_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
+/* Minimal PLL peripheral - always reports locked */
+#define RP2350_PLL_SYS_BASE     0x40050000
+#define RP2350_PLL_USB_BASE     0x40058000
+#define RP2350_PLL_SIZE         0x1000
+
+static uint64_t rp2350_pll_read(void *opaque, hwaddr offset, unsigned size) {
+    switch (offset) {
+    case 0x00: /* CS */
+        return 0x80000001; /* LOCK=1, REFDIV=1 */
+    default:
+        return 0;
+    }
+}
+
+static void rp2350_pll_write(void *opaque, hwaddr offset, uint64_t value, unsigned size) {
+    /* Ignore writes */
+}
+
+static const MemoryRegionOps rp2350_pll_ops = {
+    .read = rp2350_pll_read,
+    .write = rp2350_pll_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
 /* Minimal dummy timer to prevent sleep_ms hang */
@@ -261,6 +351,29 @@ static void rp2350_init(MachineState *machine)
     /* 1. Initialize Memory Regions */
     memory_region_init_ram(&s->sram, NULL, "rp2350.sram", RP2350_SRAM_SIZE, &error_fatal);
     memory_region_add_subregion(get_system_memory(), RP2350_SRAM_BASE, &s->sram);
+
+    /* BOOTRAM - used by BootROM for stack and RCP canary storage */
+    memory_region_init_ram(&s->bootram, NULL, "rp2350.bootram", RP2350_BOOTRAM_SIZE, &error_fatal);
+    memory_region_add_subregion(get_system_memory(), RP2350_BOOTRAM_BASE, &s->bootram);
+
+    /* Minimal RESETS peripheral */
+    memory_region_init_io(&s->resets, NULL, &rp2350_resets_ops, s,
+                          "rp2350.resets", RP2350_RESETS_SIZE);
+    memory_region_add_subregion(get_system_memory(), RP2350_RESETS_BASE, &s->resets);
+
+    /* Minimal XOSC peripheral */
+    memory_region_init_io(&s->xosc, NULL, &rp2350_xosc_ops, s,
+                          "rp2350.xosc", RP2350_XOSC_SIZE);
+    memory_region_add_subregion(get_system_memory(), RP2350_XOSC_BASE, &s->xosc);
+
+    /* Minimal PLL peripherals */
+    memory_region_init_io(&s->pll_sys, NULL, &rp2350_pll_ops, s,
+                          "rp2350.pll_sys", RP2350_PLL_SIZE);
+    memory_region_add_subregion(get_system_memory(), RP2350_PLL_SYS_BASE, &s->pll_sys);
+
+    memory_region_init_io(&s->pll_usb, NULL, &rp2350_pll_ops, s,
+                          "rp2350.pll_usb", RP2350_PLL_SIZE);
+    memory_region_add_subregion(get_system_memory(), RP2350_PLL_USB_BASE, &s->pll_usb);
 
     memory_region_init_rom(&s->flash, NULL, "rp2350.flash", RP2350_FLASH_SIZE, &error_fatal);
     memory_region_add_subregion(get_system_memory(), RP2350_FLASH_BASE, &s->flash);
