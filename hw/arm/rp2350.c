@@ -15,6 +15,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/char/pl011.h"
 #include "hw/misc/unimp.h"
+#include "hw/irq.h"
 #include "system/address-spaces.h"
 #include "system/system.h"
 #include "hw/arm/machines-qom.h"
@@ -51,6 +52,9 @@
 #define RP2350_UART0_BASE       0x40070000
 #define RP2350_UART0_IRQ        33
 
+/* IO_IRQ_BANK0 - GPIO interrupt (RP2350 has it at IRQ 21) */
+#define RP2350_IO_IRQ_BANK0     21
+
 /* SIO */
 #define RP2350_SIO_BASE         0xd0000000
 #define RP2350_SIO_SIZE         0x1000
@@ -58,8 +62,12 @@
 
 /* IO_BANK0 - GPIO function selection */
 #define RP2350_IO_BANK0_BASE    0x40028000
-#define RP2350_IO_BANK0_SIZE    0x1000
+#define RP2350_IO_BANK0_SIZE    0x4000  /* Include atomic SET/CLR/XOR aliases */
 #define RP2350_NUM_GPIOS        48
+
+/* PSM - Power State Machine */
+#define RP2350_PSM_BASE         0x40018000
+#define RP2350_PSM_SIZE         0x4000  /* Include atomic SET/CLR/XOR aliases */
 
 /* PADS_BANK0 - GPIO pad control */
 #define RP2350_PADS_BANK0_BASE  0x40038000
@@ -93,9 +101,43 @@
 #define SIO_FIFO_RD         0x058
 #define SIO_SPINLOCK_ST     0x05c
 
+/* QEMU-only magic address: write GPIO pin mask to inject rising edge on inputs.
+ * This triggers IO_IRQ_BANK0 on the appropriate core. Used by autotests to
+ * simulate keypad presses without real hardware. */
+#define SIO_QEMU_GPIO_INJECT 0x1F0
+
+/* Forward declaration */
+typedef struct RP2350State RP2350State;
+
+/* Number of INTx registers (6 registers, 8 GPIOs per reg) - needed before IO_BANK0 struct */
+#define IO_BANK0_NUM_IRQ_REGS       6
+
+/* IO_BANK0 state - defined early so SIO can reference it for GPIO injection */
+typedef struct RP2350IOBank0State {
+    MemoryRegion iomem;
+    /* Each GPIO has STATUS (ro) and CTRL (rw) registers */
+    /* ctrl[i] bits [4:0] = FUNCSEL, default 0x1f (NULL) */
+    uint32_t gpio_ctrl[RP2350_NUM_GPIOS];
+    uint32_t gpio_status[RP2350_NUM_GPIOS];
+    
+    /* Interrupt registers: 6 registers each (8 GPIOs per register, 4 bits per GPIO) */
+    uint32_t intr[IO_BANK0_NUM_IRQ_REGS];         /* Raw interrupts (write to clear edge) */
+    uint32_t proc0_inte[IO_BANK0_NUM_IRQ_REGS];   /* PROC0 interrupt enable */
+    uint32_t proc0_intf[IO_BANK0_NUM_IRQ_REGS];   /* PROC0 interrupt force */
+    uint32_t proc1_inte[IO_BANK0_NUM_IRQ_REGS];   /* PROC1 interrupt enable */
+    uint32_t proc1_intf[IO_BANK0_NUM_IRQ_REGS];   /* PROC1 interrupt force */
+    uint32_t dormant_wake_inte[IO_BANK0_NUM_IRQ_REGS];  /* Dormant wake enable */
+    uint32_t dormant_wake_intf[IO_BANK0_NUM_IRQ_REGS];  /* Dormant wake force */
+    
+    /* IRQ lines for deassertion */
+    qemu_irq io_irq_bank0[2];  /* [0]=core0, [1]=core1 */
+} RP2350IOBank0State;
+
 typedef struct RP2350SIOState {
     MemoryRegion iomem;
     ARMv7MState *core1;
+    RP2350State *parent;    /* Back pointer for GPIO injection */
+    RP2350IOBank0State *io_bank0;  /* Pointer to IO_BANK0 state for GPIO injection */
 
     /* GPIO State */
     uint32_t gpio_in;       /* GPIO0-31 input values */
@@ -121,6 +163,9 @@ typedef struct RP2350SIOState {
 
     /* Spinlocks */
     uint32_t spinlock[32];
+
+    /* IRQ lines for GPIO injection (IO_IRQ_BANK0 for each core) */
+    qemu_irq io_irq_bank0[2];  /* [0]=core0, [1]=core1 */
 } RP2350SIOState;
 
 static inline void sio_reset(RP2350SIOState *s)
@@ -432,9 +477,12 @@ static void rp2350_sio_write(void *opaque, hwaddr addr, uint64_t val,
                     /* Ensure Thread mode (no exception) */
                     arm_cpu->env.v7m.exception = 0;
 
-                    /* Mark as powered on and not halted */
+                    /* Mark as powered on and not halted, clear any stop requests */
                     arm_cpu->power_state = PSCI_ON;
                     cs->halted = 0;
+                    cs->stop = false;
+                    cs->stopped = false;
+                    cs->exit_request = false;
 
                     /* Wake up the CPU */
                     qemu_cpu_kick(cs);
@@ -455,6 +503,53 @@ static void rp2350_sio_write(void *opaque, hwaddr addr, uint64_t val,
         if (addr >= 0x100 && addr < 0x180) {
             int lock_num = (addr - 0x100) / 4;
             s->spinlock[lock_num] = 0; /* Release lock */
+        } else if (addr == SIO_QEMU_GPIO_INJECT) {
+            /* QEMU-only: inject GPIO rising edge on specified pins.
+             * Writing a bitmask here will:
+             * 1. Set the corresponding bits in gpio_in
+             * 2. Set rising-edge bits in io_bank0 INTR and INTF registers
+             * 3. Raise IO_IRQ_BANK0 on core1
+             * This allows autotests to simulate keypad presses.
+             * 
+             * Note: We set both proc0_intf and proc1_intf because the firmware
+             * may be buggy and use proc0_irq_ctrl even when running on core1.
+             * Setting INTF forces the interrupt status regardless of INTE.
+             */
+            uint32_t mask = (uint32_t)val;
+            
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "SIO_QEMU_GPIO_INJECT: mask=0x%08x\n", mask);
+            
+            /* Set gpio_in bits */
+            s->gpio_in |= mask;
+            
+            /* Set rising-edge interrupt bits in io_bank0.intr[] and intf[]
+             * Each GPIO has 4 bits: [3]=edge_high, [2]=edge_low, [1]=level_high, [0]=level_low
+             * Rising edge = edge_high = bit 3 within each 4-bit group
+             * GPIO_IRQ_EDGE_RISE = 0x8 (bit 3)
+             */
+            if (s->io_bank0) {
+                for (int gpio = 0; gpio < 32; gpio++) {
+                    if (mask & (1u << gpio)) {
+                        int reg_idx = gpio / 8;
+                        int bit_pos = (gpio % 8) * 4 + 3;  /* edge_high bit */
+                        s->io_bank0->intr[reg_idx] |= (1u << bit_pos);
+                        /* Set INTF (force) for both cores to force INTS high */
+                        s->io_bank0->proc0_intf[reg_idx] |= (1u << bit_pos);
+                        s->io_bank0->proc1_intf[reg_idx] |= (1u << bit_pos);
+                        qemu_log_mask(LOG_GUEST_ERROR,
+                                      "SIO_QEMU_GPIO_INJECT: set INTR/INTF[%d] bit %d for GPIO %d\n",
+                                      reg_idx, bit_pos, gpio);
+                    }
+                }
+            }
+            
+            /* Raise IO_IRQ_BANK0 on core1 if the IRQ line is valid. */
+            if (s->io_irq_bank0[1]) {
+                qemu_set_irq(s->io_irq_bank0[1], 1);
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "SIO_QEMU_GPIO_INJECT: raised IO_IRQ_BANK0 on core1\n");
+            }
         } else {
             qemu_log_mask(LOG_UNIMP,
                           "rp2350_sio_write: unimplemented offset 0x%"HWADDR_PRIx"\n",
@@ -471,13 +566,22 @@ static const MemoryRegionOps rp2350_sio_ops = {
 };
 
 /* ========== IO_BANK0 - GPIO Function Selection ========== */
-typedef struct RP2350IOBank0State {
-    MemoryRegion iomem;
-    /* Each GPIO has STATUS (ro) and CTRL (rw) registers */
-    /* ctrl[i] bits [4:0] = FUNCSEL, default 0x1f (NULL) */
-    uint32_t gpio_ctrl[RP2350_NUM_GPIOS];
-    uint32_t gpio_status[RP2350_NUM_GPIOS];
-} RP2350IOBank0State;
+
+/* IO_BANK0 Register Offsets */
+#define IO_BANK0_GPIO_STATUS_BASE   0x000   /* Status regs: 0x000 + gpio*8 */
+#define IO_BANK0_GPIO_CTRL_BASE     0x004   /* Ctrl regs: 0x004 + gpio*8 */
+#define IO_BANK0_INTR_BASE          0x230   /* Raw interrupts: INTR[0-5] */
+#define IO_BANK0_PROC0_INTE_BASE    0x248   /* PROC0 interrupt enable: INTE[0-5] */
+#define IO_BANK0_PROC0_INTF_BASE    0x260   /* PROC0 interrupt force: INTF[0-5] */
+#define IO_BANK0_PROC0_INTS_BASE    0x278   /* PROC0 interrupt status: INTS[0-5] */
+#define IO_BANK0_PROC1_INTE_BASE    0x290   /* PROC1 interrupt enable: INTE[0-5] */
+#define IO_BANK0_PROC1_INTF_BASE    0x2A8   /* PROC1 interrupt force: INTF[0-5] */
+#define IO_BANK0_PROC1_INTS_BASE    0x2C0   /* PROC1 interrupt status: INTS[0-5] */
+#define IO_BANK0_DORMANT_WAKE_INTE_BASE 0x2D8  /* Dormant wake interrupt enable */
+#define IO_BANK0_DORMANT_WAKE_INTF_BASE 0x2F0  /* Dormant wake interrupt force */
+#define IO_BANK0_DORMANT_WAKE_INTS_BASE 0x308  /* Dormant wake interrupt status */
+
+/* Note: IO_BANK0_NUM_IRQ_REGS and RP2350IOBank0State are defined earlier (before SIO) */
 
 static void io_bank0_reset(RP2350IOBank0State *s)
 {
@@ -485,17 +589,50 @@ static void io_bank0_reset(RP2350IOBank0State *s)
         s->gpio_ctrl[i] = 0x1f; /* FUNCSEL = NULL (0x1f) */
         s->gpio_status[i] = 0;
     }
+    /* Clear all interrupt registers */
+    for (int i = 0; i < IO_BANK0_NUM_IRQ_REGS; i++) {
+        s->intr[i] = 0;
+        s->proc0_inte[i] = 0;
+        s->proc0_intf[i] = 0;
+        s->proc1_inte[i] = 0;
+        s->proc1_intf[i] = 0;
+        s->dormant_wake_inte[i] = 0;
+        s->dormant_wake_intf[i] = 0;
+    }
+}
+
+/* Atomic operation types for RP2350 peripheral aliases */
+#define ATOMIC_NORMAL   0   /* Direct read/write at +0x0000 */
+#define ATOMIC_XOR      1   /* XOR alias at +0x1000 */
+#define ATOMIC_SET      2   /* SET alias at +0x2000 */
+#define ATOMIC_CLR      3   /* CLR alias at +0x3000 */
+
+/* Helper to apply atomic write operation */
+static inline void atomic_write_op(uint32_t *reg, uint32_t val, int op) {
+    switch (op) {
+        case ATOMIC_NORMAL: *reg = val; break;
+        case ATOMIC_XOR:    *reg ^= val; break;
+        case ATOMIC_SET:    *reg |= val; break;
+        case ATOMIC_CLR:    *reg &= ~val; break;
+    }
 }
 
 static uint64_t rp2350_io_bank0_read(void *opaque, hwaddr addr, unsigned size)
 {
     RP2350IOBank0State *s = opaque;
     uint64_t val = 0;
+    
+    /* Extract atomic operation type and base offset */
+    int atomic_op = (addr >> 12) & 0x3;
+    hwaddr reg_offset = addr & 0xFFF;
+    
+    /* For reads, atomic aliases return the same value as base register */
+    (void)atomic_op;
 
     /* GPIO status/ctrl: GPIOx_STATUS at 0x000 + 8*x, GPIOx_CTRL at 0x004 + 8*x */
-    if (addr < (RP2350_NUM_GPIOS * 8)) {
-        int gpio = addr / 8;
-        int reg = addr % 8;
+    if (reg_offset < (RP2350_NUM_GPIOS * 8)) {
+        int gpio = reg_offset / 8;
+        int reg = reg_offset % 8;
         if (reg == 0) {
             /* STATUS register */
             val = s->gpio_status[gpio];
@@ -503,7 +640,61 @@ static uint64_t rp2350_io_bank0_read(void *opaque, hwaddr addr, unsigned size)
             /* CTRL register */
             val = s->gpio_ctrl[gpio];
         }
-    } else {
+    }
+    /* Raw Interrupts: INTR[0-5] at 0x230-0x244 */
+    else if (reg_offset >= IO_BANK0_INTR_BASE && reg_offset < IO_BANK0_INTR_BASE + IO_BANK0_NUM_IRQ_REGS * 4) {
+        int reg = (reg_offset - IO_BANK0_INTR_BASE) / 4;
+        val = s->intr[reg];
+    }
+    /* PROC0 Interrupt Enable: INTE[0-5] at 0x248-0x25C */
+    else if (reg_offset >= IO_BANK0_PROC0_INTE_BASE && reg_offset < IO_BANK0_PROC0_INTE_BASE + IO_BANK0_NUM_IRQ_REGS * 4) {
+        int reg = (reg_offset - IO_BANK0_PROC0_INTE_BASE) / 4;
+        val = s->proc0_inte[reg];
+    }
+    /* PROC0 Interrupt Force: INTF[0-5] at 0x260-0x274 */
+    else if (reg_offset >= IO_BANK0_PROC0_INTF_BASE && reg_offset < IO_BANK0_PROC0_INTF_BASE + IO_BANK0_NUM_IRQ_REGS * 4) {
+        int reg = (reg_offset - IO_BANK0_PROC0_INTF_BASE) / 4;
+        val = s->proc0_intf[reg];
+    }
+    /* PROC0 Interrupt Status: INTS[0-5] at 0x278-0x28C (read-only, computed) */
+    else if (reg_offset >= IO_BANK0_PROC0_INTS_BASE && reg_offset < IO_BANK0_PROC0_INTS_BASE + IO_BANK0_NUM_IRQ_REGS * 4) {
+        int reg = (reg_offset - IO_BANK0_PROC0_INTS_BASE) / 4;
+        /* INTS = (INTR & INTE) | INTF */
+        val = (s->intr[reg] & s->proc0_inte[reg]) | s->proc0_intf[reg];
+    }
+    /* PROC1 Interrupt Enable: INTE[0-5] at 0x290-0x2A4 */
+    else if (reg_offset >= IO_BANK0_PROC1_INTE_BASE && reg_offset < IO_BANK0_PROC1_INTE_BASE + IO_BANK0_NUM_IRQ_REGS * 4) {
+        int reg = (reg_offset - IO_BANK0_PROC1_INTE_BASE) / 4;
+        val = s->proc1_inte[reg];
+    }
+    /* PROC1 Interrupt Force: INTF[0-5] at 0x2A8-0x2BC */
+    else if (reg_offset >= IO_BANK0_PROC1_INTF_BASE && reg_offset < IO_BANK0_PROC1_INTF_BASE + IO_BANK0_NUM_IRQ_REGS * 4) {
+        int reg = (reg_offset - IO_BANK0_PROC1_INTF_BASE) / 4;
+        val = s->proc1_intf[reg];
+    }
+    /* PROC1 Interrupt Status: INTS[0-5] at 0x2C0-0x2D4 (read-only, computed) */
+    else if (reg_offset >= IO_BANK0_PROC1_INTS_BASE && reg_offset < IO_BANK0_PROC1_INTS_BASE + IO_BANK0_NUM_IRQ_REGS * 4) {
+        int reg = (reg_offset - IO_BANK0_PROC1_INTS_BASE) / 4;
+        /* INTS = (INTR & INTE) | INTF */
+        val = (s->intr[reg] & s->proc1_inte[reg]) | s->proc1_intf[reg];
+    }
+    /* Dormant Wake Interrupt Enable: INTE[0-5] at 0x2D8-0x2EC */
+    else if (reg_offset >= IO_BANK0_DORMANT_WAKE_INTE_BASE && reg_offset < IO_BANK0_DORMANT_WAKE_INTE_BASE + IO_BANK0_NUM_IRQ_REGS * 4) {
+        int reg = (reg_offset - IO_BANK0_DORMANT_WAKE_INTE_BASE) / 4;
+        val = s->dormant_wake_inte[reg];
+    }
+    /* Dormant Wake Interrupt Force: INTF[0-5] at 0x2F0-0x304 */
+    else if (reg_offset >= IO_BANK0_DORMANT_WAKE_INTF_BASE && reg_offset < IO_BANK0_DORMANT_WAKE_INTF_BASE + IO_BANK0_NUM_IRQ_REGS * 4) {
+        int reg = (reg_offset - IO_BANK0_DORMANT_WAKE_INTF_BASE) / 4;
+        val = s->dormant_wake_intf[reg];
+    }
+    /* Dormant Wake Interrupt Status: INTS[0-5] at 0x308-0x31C (read-only, computed) */
+    else if (reg_offset >= IO_BANK0_DORMANT_WAKE_INTS_BASE && reg_offset < IO_BANK0_DORMANT_WAKE_INTS_BASE + IO_BANK0_NUM_IRQ_REGS * 4) {
+        int reg = (reg_offset - IO_BANK0_DORMANT_WAKE_INTS_BASE) / 4;
+        /* INTS = (INTR & INTE) | INTF */
+        val = (s->intr[reg] & s->dormant_wake_inte[reg]) | s->dormant_wake_intf[reg];
+    }
+    else {
         qemu_log_mask(LOG_UNIMP,
                       "rp2350_io_bank0_read: unimplemented offset 0x%"HWADDR_PRIx"\n",
                       addr);
@@ -515,17 +706,91 @@ static void rp2350_io_bank0_write(void *opaque, hwaddr addr, uint64_t val,
                                    unsigned size)
 {
     RP2350IOBank0State *s = opaque;
+    
+    /* Extract atomic operation type and base offset */
+    int atomic_op = (addr >> 12) & 0x3;
+    hwaddr reg_offset = addr & 0xFFF;
 
     /* GPIO status/ctrl: GPIOx_STATUS at 0x000 + 8*x, GPIOx_CTRL at 0x004 + 8*x */
-    if (addr < (RP2350_NUM_GPIOS * 8)) {
-        int gpio = addr / 8;
-        int reg = addr % 8;
+    if (reg_offset < (RP2350_NUM_GPIOS * 8)) {
+        int gpio = reg_offset / 8;
+        int reg = reg_offset % 8;
         if (reg == 4) {
-            /* CTRL register - writable */
-            s->gpio_ctrl[gpio] = val;
+            /* CTRL register - writable with atomic ops */
+            atomic_write_op(&s->gpio_ctrl[gpio], val, atomic_op);
         }
         /* STATUS register is read-only */
-    } else {
+    }
+    /* Raw Interrupts: INTR[0-5] at 0x230-0x244 - write 1 to clear edge events */
+    else if (reg_offset >= IO_BANK0_INTR_BASE && reg_offset < IO_BANK0_INTR_BASE + IO_BANK0_NUM_IRQ_REGS * 4) {
+        int reg = (reg_offset - IO_BANK0_INTR_BASE) / 4;
+        /* Write 1 to clear: only clear bits for edge events (bits 2,3 per GPIO) */
+        /* Each GPIO has 4 bits: [EDGE_HIGH, EDGE_LOW, LEVEL_HIGH, LEVEL_LOW] */
+        /* Bits 3,2 are edge bits that can be cleared by writing 1 */
+        uint32_t edge_mask = 0;
+        for (int i = 0; i < 8; i++) {
+            edge_mask |= (0xC << (i * 4)); /* bits 2,3 of each 4-bit field */
+        }
+        uint32_t clear_bits = val & edge_mask;
+        /* For INTR, write-1-to-clear doesn't use atomic ops the same way */
+        s->intr[reg] &= ~clear_bits;
+        /* Also clear INTF bits that were set by GPIO injection (QEMU workaround) */
+        s->proc0_intf[reg] &= ~clear_bits;
+        s->proc1_intf[reg] &= ~clear_bits;
+        
+        /* Check if all INTS are now 0, and deassert IRQ if so */
+        uint32_t proc0_ints = (s->intr[reg] & s->proc0_inte[reg]) | s->proc0_intf[reg];
+        uint32_t proc1_ints = (s->intr[reg] & s->proc1_inte[reg]) | s->proc1_intf[reg];
+        if (proc0_ints == 0 && s->io_irq_bank0[0]) {
+            qemu_set_irq(s->io_irq_bank0[0], 0);
+        }
+        if (proc1_ints == 0 && s->io_irq_bank0[1]) {
+            qemu_set_irq(s->io_irq_bank0[1], 0);
+        }
+    }
+    /* PROC0 Interrupt Enable: INTE[0-5] at 0x248-0x25C */
+    else if (reg_offset >= IO_BANK0_PROC0_INTE_BASE && reg_offset < IO_BANK0_PROC0_INTE_BASE + IO_BANK0_NUM_IRQ_REGS * 4) {
+        int reg = (reg_offset - IO_BANK0_PROC0_INTE_BASE) / 4;
+        atomic_write_op(&s->proc0_inte[reg], val, atomic_op);
+    }
+    /* PROC0 Interrupt Force: INTF[0-5] at 0x260-0x274 */
+    else if (reg_offset >= IO_BANK0_PROC0_INTF_BASE && reg_offset < IO_BANK0_PROC0_INTF_BASE + IO_BANK0_NUM_IRQ_REGS * 4) {
+        int reg = (reg_offset - IO_BANK0_PROC0_INTF_BASE) / 4;
+        atomic_write_op(&s->proc0_intf[reg], val, atomic_op);
+    }
+    /* PROC0 INTS is read-only */
+    else if (reg_offset >= IO_BANK0_PROC0_INTS_BASE && reg_offset < IO_BANK0_PROC0_INTS_BASE + IO_BANK0_NUM_IRQ_REGS * 4) {
+        /* Ignore writes to read-only register */
+    }
+    /* PROC1 Interrupt Enable: INTE[0-5] at 0x290-0x2A4 */
+    else if (reg_offset >= IO_BANK0_PROC1_INTE_BASE && reg_offset < IO_BANK0_PROC1_INTE_BASE + IO_BANK0_NUM_IRQ_REGS * 4) {
+        int reg = (reg_offset - IO_BANK0_PROC1_INTE_BASE) / 4;
+        atomic_write_op(&s->proc1_inte[reg], val, atomic_op);
+    }
+    /* PROC1 Interrupt Force: INTF[0-5] at 0x2A8-0x2BC */
+    else if (reg_offset >= IO_BANK0_PROC1_INTF_BASE && reg_offset < IO_BANK0_PROC1_INTF_BASE + IO_BANK0_NUM_IRQ_REGS * 4) {
+        int reg = (reg_offset - IO_BANK0_PROC1_INTF_BASE) / 4;
+        atomic_write_op(&s->proc1_intf[reg], val, atomic_op);
+    }
+    /* PROC1 INTS is read-only */
+    else if (reg_offset >= IO_BANK0_PROC1_INTS_BASE && reg_offset < IO_BANK0_PROC1_INTS_BASE + IO_BANK0_NUM_IRQ_REGS * 4) {
+        /* Ignore writes to read-only register */
+    }
+    /* Dormant Wake Interrupt Enable: INTE[0-5] at 0x2D8-0x2EC */
+    else if (reg_offset >= IO_BANK0_DORMANT_WAKE_INTE_BASE && reg_offset < IO_BANK0_DORMANT_WAKE_INTE_BASE + IO_BANK0_NUM_IRQ_REGS * 4) {
+        int reg = (reg_offset - IO_BANK0_DORMANT_WAKE_INTE_BASE) / 4;
+        atomic_write_op(&s->dormant_wake_inte[reg], val, atomic_op);
+    }
+    /* Dormant Wake Interrupt Force: INTF[0-5] at 0x2F0-0x304 */
+    else if (reg_offset >= IO_BANK0_DORMANT_WAKE_INTF_BASE && reg_offset < IO_BANK0_DORMANT_WAKE_INTF_BASE + IO_BANK0_NUM_IRQ_REGS * 4) {
+        int reg = (reg_offset - IO_BANK0_DORMANT_WAKE_INTF_BASE) / 4;
+        atomic_write_op(&s->dormant_wake_intf[reg], val, atomic_op);
+    }
+    /* Dormant Wake INTS is read-only */
+    else if (reg_offset >= IO_BANK0_DORMANT_WAKE_INTS_BASE && reg_offset < IO_BANK0_DORMANT_WAKE_INTS_BASE + IO_BANK0_NUM_IRQ_REGS * 4) {
+        /* Ignore writes to read-only register */
+    }
+    else {
         qemu_log_mask(LOG_UNIMP,
                       "rp2350_io_bank0_write: unimplemented offset 0x%"HWADDR_PRIx"\n",
                       addr);
@@ -606,7 +871,10 @@ static const MemoryRegionOps rp2350_pads_bank0_ops = {
 };
 
 /* ========== TIMER - Microsecond Timer (struct only) ========== */
-typedef struct RP2350TimerState {
+typedef struct RP2350TimerState RP2350TimerState;
+typedef struct RP2350State RP2350State;
+
+struct RP2350TimerState {
     MemoryRegion iomem;
     int64_t start_time_ns;  /* QEMU clock time when timer started */
     uint32_t alarm[4];
@@ -615,7 +883,11 @@ typedef struct RP2350TimerState {
     uint32_t inte;
     uint32_t intf;
     uint32_t latched_hi;    /* For atomic 64-bit reads */
-} RP2350TimerState;
+    QEMUTimer *alarm_timer[4];  /* QEMU timers for each alarm */
+    qemu_irq irq[4];            /* IRQ lines for each alarm */
+    RP2350State *parent;        /* Back pointer to parent state */
+    int timer_index;            /* 0 for timer0, 1 for timer1 */
+};
 
 /* QOM Declaration */
 #define TYPE_RP2350_MACHINE MACHINE_TYPE_NAME("rp2350")
@@ -656,6 +928,133 @@ struct RP2350State {
 
     /* Minimal POWMAN peripheral */
     MemoryRegion powman;
+
+    /* PSM (Power State Machine) peripheral */
+    MemoryRegion psm;
+    uint32_t psm_frce_on;
+    uint32_t psm_frce_off;
+};
+
+/* PSM (Power State Machine) - controls power domains including core1 */
+#define PSM_FRCE_ON_OFFSET      0x00
+#define PSM_FRCE_OFF_OFFSET     0x04
+#define PSM_WDSEL_OFFSET        0x08
+#define PSM_DONE_OFFSET         0x0c
+#define PSM_PROC1_BITS          (1 << 24)
+
+static uint64_t rp2350_psm_read(void *opaque, hwaddr offset, unsigned size)
+{
+    RP2350State *s = opaque;
+    uint32_t base_offset = offset & 0xfff;
+    uint64_t val = 0;
+    
+    /* Handle atomic aliases */
+    uint32_t alias = (offset >> 12) & 0x3;
+    if (alias != 0) {
+        base_offset = offset & 0xfff;
+    }
+    
+    switch (base_offset) {
+    case PSM_FRCE_ON_OFFSET:
+        val = s->psm_frce_on;
+        break;
+    case PSM_FRCE_OFF_OFFSET:
+        val = s->psm_frce_off;
+        break;
+    case PSM_WDSEL_OFFSET:
+        val = 0;
+        break;
+    case PSM_DONE_OFFSET:
+        /* Report all power domains ready, except those force-off */
+        val = 0x01ffffff & ~s->psm_frce_off;
+        break;
+    default:
+        val = 0;
+        break;
+    }
+    
+    qemu_log_mask(LOG_GUEST_ERROR, "PSM read: offset=0x%x alias=%d -> 0x%lx\n",
+                  base_offset, alias, (unsigned long)val);
+    return val;
+}
+
+static void rp2350_psm_write(void *opaque, hwaddr offset, uint64_t value, unsigned size)
+{
+    RP2350State *s = opaque;
+    uint32_t base_offset = offset & 0xfff;
+    uint32_t alias = (offset >> 12) & 0x3;
+    uint32_t old_frce_off = s->psm_frce_off;
+    /* RP2350 atomic aliases: 0=normal, 1=XOR, 2=SET, 3=CLR */
+    
+    qemu_log_mask(LOG_GUEST_ERROR, "PSM write: offset=0x%x alias=%d value=0x%lx\n",
+                  base_offset, alias, (unsigned long)value);
+    
+    switch (base_offset) {
+    case PSM_FRCE_ON_OFFSET:
+        switch (alias) {
+        case 0: s->psm_frce_on = value; break;
+        case 1: s->psm_frce_on ^= value; break;  /* XOR */
+        case 2: s->psm_frce_on |= value; break;  /* SET */
+        case 3: s->psm_frce_on &= ~value; break; /* CLR */
+        }
+        /* If PROC1 is force-on, wake it up (clear force-off) */
+        if (s->psm_frce_on & PSM_PROC1_BITS) {
+            s->psm_frce_off &= ~PSM_PROC1_BITS;
+        }
+        break;
+    case PSM_FRCE_OFF_OFFSET:
+        switch (alias) {
+        case 0: s->psm_frce_off = value; break;
+        case 1: s->psm_frce_off ^= value; break;  /* XOR */
+        case 2: s->psm_frce_off |= value; break;  /* SET */
+        case 3: s->psm_frce_off &= ~value; break; /* CLR */
+        }
+        /* Handle PROC1 power state transitions */
+        if ((s->psm_frce_off & PSM_PROC1_BITS) && !(old_frce_off & PSM_PROC1_BITS)) {
+            /* PROC1 is being turned OFF - halt the CPU properly.
+             * Only call cpu_exit if the CPU has been created/started,
+             * otherwise just mark as halted.
+             */
+            CPUState *cs = CPU(s->cpu[1].cpu);
+            if (cs) {
+                cs->halted = 1;
+                cs->stop = true;
+                /* Only try to kick the CPU if it has a valid thread */
+                if (cs->thread) {
+                    cpu_exit(cs);
+                }
+                /* Reset the launch state machine so core1 can be relaunched */
+                s->sio.launch_state = 0;
+            }
+        } else if (!(s->psm_frce_off & PSM_PROC1_BITS) && (old_frce_off & PSM_PROC1_BITS)) {
+            /* PROC1 is being turned ON from reset state 
+             * Simulate bootrom behavior: drain FIFO and push 0 to core0's FIFO.
+             * The real bootrom does this when core1 comes out of reset.
+             */
+            /* Reset the SIO launch state machine */
+            s->sio.launch_state = 0;
+            /* Drain the TX FIFO (core0->core1 direction) */
+            s->sio.tx_r = s->sio.tx_w = s->sio.tx_count = 0;
+            /* Push 0 to the RX FIFO (core1->core0 direction, simulating bootrom handshake) */
+            if (s->sio.rx_count < 4) {
+                s->sio.rx_fifo[s->sio.rx_w] = 0;
+                s->sio.rx_w = (s->sio.rx_w + 1) & 3;
+                s->sio.rx_count++;
+            }
+        }
+        break;
+    case PSM_WDSEL_OFFSET:
+        /* Watchdog select - ignore for now */
+        break;
+    default:
+        break;
+    }
+}
+
+static const MemoryRegionOps rp2350_psm_ops = {
+    .read = rp2350_psm_read,
+    .write = rp2350_psm_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
 /* Minimal RESETS peripheral - always reports all peripherals out of reset */
@@ -791,12 +1190,6 @@ static const MemoryRegionOps rp2350_powman_ops = {
 #define RP2350_TIMER1_BASE      0x400b8000
 #define RP2350_TIMER_SIZE       0x4000  /* Include atomic aliases: normal, SET, CLR, XOR */
 
-/* Atomic alias offsets for RP2350 peripherals */
-#define ATOMIC_NORMAL   0x0000
-#define ATOMIC_SET      0x1000
-#define ATOMIC_CLR      0x2000
-#define ATOMIC_XOR      0x3000
-
 /* Timer register offsets */
 #define TIMER_TIMEHW        0x00
 #define TIMER_TIMELW        0x04
@@ -817,6 +1210,96 @@ static const MemoryRegionOps rp2350_powman_ops = {
 #define TIMER_INTE          0x40
 #define TIMER_INTF          0x44
 #define TIMER_INTS          0x48
+
+/* Timer IRQ numbers for RP2350 (from datasheet) */
+#define TIMER0_IRQ_0        0
+#define TIMER0_IRQ_1        1
+#define TIMER0_IRQ_2        2
+#define TIMER0_IRQ_3        3
+#define TIMER1_IRQ_0        4
+#define TIMER1_IRQ_1        5
+#define TIMER1_IRQ_2        6
+#define TIMER1_IRQ_3        7
+
+/* Forward declaration */
+static void rp2350_timer_update_irq(RP2350TimerState *s);
+static uint64_t timer_get_time_us(RP2350TimerState *s);
+
+/* Timer alarm callback - called when a QEMU timer expires */
+static void rp2350_timer_alarm_cb(void *opaque)
+{
+    RP2350TimerState *s = opaque;
+    uint64_t now_us = timer_get_time_us(s);
+    int i;
+    
+    /* Check each alarm */
+    for (i = 0; i < 4; i++) {
+        if (s->armed & (1 << i)) {
+            /* Check if alarm time has been reached (compare low 32 bits) */
+            if ((uint32_t)now_us >= s->alarm[i]) {
+                /* Alarm fired - set interrupt flag and disarm */
+                s->intf |= (1 << i);
+                s->armed &= ~(1 << i);
+            }
+        }
+    }
+    
+    /* Update interrupt line */
+    rp2350_timer_update_irq(s);
+    
+    /* Reschedule if any alarms are still armed */
+    if (s->armed) {
+        /* Find the nearest alarm */
+        uint32_t next_alarm = UINT32_MAX;
+        for (i = 0; i < 4; i++) {
+            if ((s->armed & (1 << i)) && s->alarm[i] < next_alarm) {
+                next_alarm = s->alarm[i];
+            }
+        }
+        if (next_alarm != UINT32_MAX) {
+            /* Schedule next callback - convert from microseconds to nanoseconds */
+            int64_t target_ns = s->start_time_ns + (int64_t)next_alarm * 1000;
+            timer_mod(s->alarm_timer[0], target_ns);
+        }
+    }
+}
+
+/* Update timer alarm scheduling */
+static void rp2350_timer_schedule_alarm(RP2350TimerState *s)
+{
+    if (!s->armed) {
+        return;
+    }
+    
+    /* Find the nearest alarm */
+    uint32_t next_alarm = UINT32_MAX;
+    int i;
+    for (i = 0; i < 4; i++) {
+        if ((s->armed & (1 << i)) && s->alarm[i] < next_alarm) {
+            next_alarm = s->alarm[i];
+        }
+    }
+    
+    if (next_alarm != UINT32_MAX) {
+        /* Schedule callback - convert from microseconds to nanoseconds */
+        int64_t target_ns = s->start_time_ns + (int64_t)next_alarm * 1000;
+        timer_mod(s->alarm_timer[0], target_ns);
+    }
+}
+
+/* Update interrupt line based on INTE, INTF */
+static void rp2350_timer_update_irq(RP2350TimerState *s)
+{
+    uint32_t ints = s->inte & s->intf;
+    int i;
+    
+    /* Each alarm has its own IRQ line */
+    for (i = 0; i < 4; i++) {
+        if (s->irq[i]) {
+            qemu_set_irq(s->irq[i], (ints >> i) & 1);
+        }
+    }
+}
 
 static uint64_t timer_get_time_us(RP2350TimerState *s)
 {
@@ -910,6 +1393,8 @@ static void rp2350_timer_write(void *opaque, hwaddr offset, uint64_t val,
     case TIMER_ALARM3:
         ATOMIC_WRITE(s->alarm[(reg_offset - TIMER_ALARM0) / 4], val);
         s->armed |= (1 << ((reg_offset - TIMER_ALARM0) / 4));
+        /* Schedule the alarm */
+        rp2350_timer_schedule_alarm(s);
         break;
     case TIMER_ARMED:
         /* Writing 1 disarms the alarm */
@@ -920,15 +1405,20 @@ static void rp2350_timer_write(void *opaque, hwaddr offset, uint64_t val,
         break;
     case TIMER_INTE:
         ATOMIC_WRITE(s->inte, val & 0xf);
+        rp2350_timer_update_irq(s);
         break;
     case TIMER_INTF:
         ATOMIC_WRITE(s->intf, val & 0xf);
+        rp2350_timer_update_irq(s);
         break;
     case TIMER_INTR:
         /* Write to clear interrupts */
         s->intf &= ~val;
+        rp2350_timer_update_irq(s);
         break;
     default:
+        qemu_log_mask(LOG_GUEST_ERROR, "TIMER write: offset=0x%lx val=0x%lx\n",
+                      (unsigned long)reg_offset, (unsigned long)val);
         break;
     }
 
@@ -975,6 +1465,13 @@ static void rp2350_init(MachineState *machine)
     memory_region_init_io(&s->resets, NULL, &rp2350_resets_ops, s,
                           "rp2350.resets", RP2350_RESETS_SIZE);
     memory_region_add_subregion(get_system_memory(), RP2350_RESETS_BASE, &s->resets);
+
+    /* PSM (Power State Machine) peripheral */
+    s->psm_frce_on = 0;
+    s->psm_frce_off = 0;
+    memory_region_init_io(&s->psm, NULL, &rp2350_psm_ops, s,
+                          "rp2350.psm", RP2350_PSM_SIZE);
+    memory_region_add_subregion(get_system_memory(), RP2350_PSM_BASE, &s->psm);
 
     /* Minimal XOSC peripheral */
     memory_region_init_io(&s->xosc, NULL, &rp2350_xosc_ops, s,
@@ -1099,6 +1596,9 @@ static void rp2350_init(MachineState *machine)
 
     /* SIO (includes GPIO and FIFO) */
     s->sio.core1 = &s->cpu[1];
+    s->sio.parent = s;  /* Back pointer for GPIO injection */
+    s->sio.io_irq_bank0[0] = qdev_get_gpio_in(DEVICE(&s->cpu[0]), RP2350_IO_IRQ_BANK0);
+    s->sio.io_irq_bank0[1] = qdev_get_gpio_in(DEVICE(&s->cpu[1]), RP2350_IO_IRQ_BANK0);
     sio_reset(&s->sio);
     memory_region_init_io(&s->sio.iomem, OBJECT(machine), &rp2350_sio_ops,
                           &s->sio, "rp2350.sio", RP2350_SIO_SIZE);
@@ -1111,6 +1611,13 @@ static void rp2350_init(MachineState *machine)
                           &s->io_bank0, "rp2350.io_bank0", RP2350_IO_BANK0_SIZE);
     memory_region_add_subregion(get_system_memory(), RP2350_IO_BANK0_BASE,
                                 &s->io_bank0.iomem);
+    
+    /* Connect SIO to IO_BANK0 for GPIO injection */
+    s->sio.io_bank0 = &s->io_bank0;
+    
+    /* Set up IO_BANK0 IRQ lines for deassertion */
+    s->io_bank0.io_irq_bank0[0] = qdev_get_gpio_in(DEVICE(&s->cpu[0]), RP2350_IO_IRQ_BANK0);
+    s->io_bank0.io_irq_bank0[1] = qdev_get_gpio_in(DEVICE(&s->cpu[1]), RP2350_IO_IRQ_BANK0);
 
     /* PADS_BANK0 - GPIO pad control */
     pads_bank0_reset(&s->pads_bank0);
@@ -1121,6 +1628,15 @@ static void rp2350_init(MachineState *machine)
 
     /* TIMER0 - Microsecond timer */
     rp2350_timer_reset(&s->timer0);
+    s->timer0.parent = s;
+    s->timer0.timer_index = 0;
+    /* Create QEMU timer for alarm callbacks - use just one timer for all 4 alarms */
+    s->timer0.alarm_timer[0] = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                             rp2350_timer_alarm_cb, &s->timer0);
+    /* Connect IRQ lines to NVIC - Timer0 uses IRQs 0-3 */
+    for (int i = 0; i < 4; i++) {
+        s->timer0.irq[i] = qdev_get_gpio_in(DEVICE(&s->cpu[0]), TIMER0_IRQ_0 + i);
+    }
     memory_region_init_io(&s->timer0.iomem, OBJECT(machine), &rp2350_timer_ops,
                           &s->timer0, "rp2350.timer0", RP2350_TIMER_SIZE);
     memory_region_add_subregion(get_system_memory(), RP2350_TIMER0_BASE,
@@ -1128,6 +1644,15 @@ static void rp2350_init(MachineState *machine)
 
     /* TIMER1 - Microsecond timer */
     rp2350_timer_reset(&s->timer1);
+    s->timer1.parent = s;
+    s->timer1.timer_index = 1;
+    /* Create QEMU timer for alarm callbacks */
+    s->timer1.alarm_timer[0] = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                             rp2350_timer_alarm_cb, &s->timer1);
+    /* Connect IRQ lines to NVIC - Timer1 uses IRQs 4-7 */
+    for (int i = 0; i < 4; i++) {
+        s->timer1.irq[i] = qdev_get_gpio_in(DEVICE(&s->cpu[0]), TIMER1_IRQ_0 + i);
+    }
     memory_region_init_io(&s->timer1.iomem, OBJECT(machine), &rp2350_timer_ops,
                           &s->timer1, "rp2350.timer1", RP2350_TIMER_SIZE);
     memory_region_add_subregion(get_system_memory(), RP2350_TIMER1_BASE,
