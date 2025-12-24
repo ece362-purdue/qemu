@@ -14,6 +14,7 @@
 #include "hw/boards.h"
 #include "hw/qdev-properties.h"
 #include "hw/char/pl011.h"
+#include "hw/ssi/pl022.h"
 #include "hw/misc/unimp.h"
 #include "hw/irq.h"
 #include "system/address-spaces.h"
@@ -72,6 +73,33 @@
 /* PADS_BANK0 - GPIO pad control */
 #define RP2350_PADS_BANK0_BASE  0x40038000
 #define RP2350_PADS_BANK0_SIZE  0x1000
+
+/* ADC - Analog-to-Digital Converter */
+#define RP2350_ADC_BASE         0x400a0000
+#define RP2350_ADC_SIZE         0x1000
+
+/* DMA - Direct Memory Access */
+#define RP2350_DMA_BASE         0x50000000
+#define RP2350_DMA_SIZE         0x1000
+
+/* PWM - Pulse Width Modulation */
+#define RP2350_PWM_BASE         0x400a8000
+#define RP2350_PWM_SIZE         0x4000  /* 16KB: base + XOR/SET/CLR aliases */
+
+/* SPI - Synchronous Serial Port (PL022) */
+#define RP2350_SPI0_BASE        0x40080000
+#define RP2350_SPI1_BASE        0x40088000
+#define RP2350_SPI_SIZE         0x4000  /* 16KB: base + XOR/SET/CLR aliases */
+#define RP2350_SPI0_IRQ         31
+#define RP2350_SPI1_IRQ         32
+
+/* ADC/DMA Shared Constants */
+#define RP2350_NUM_DMA_CHANNELS 16
+#define RP2350_ADC_FIFO_SIZE    16      /* ADC sample FIFO depth */
+#define DREQ_ADC                48      /* DMA Request select for ADC */
+
+/* PWM Constants */
+#define RP2350_NUM_PWM_SLICES   12      /* PWM has 12 slices (channels) */
 
 /* Minimal IDAU for BootROM bring-up (implemented in hw/misc/rp2350-idau.c). */
 #define TYPE_RP2350_IDAU "rp2350-idau"
@@ -132,6 +160,88 @@ typedef struct RP2350IOBank0State {
     /* IRQ lines for deassertion */
     qemu_irq io_irq_bank0[2];  /* [0]=core0, [1]=core1 */
 } RP2350IOBank0State;
+
+/* ADC state */
+typedef struct RP2350ADCState {
+    MemoryRegion iomem;
+    
+    /* ADC Registers */
+    uint32_t cs;            /* Control/Status (EN, START_ONCE, START_MANY, READY, ERR, AINSEL, RROBIN) */
+    uint32_t result;        /* 12-bit result of last conversion */
+    uint32_t fcs;           /* FIFO Control/Status (EN, SHIFT, ERR, DREQ_EN, EMPTY, FULL, UNDER, OVER, LEVEL, THRESH) */
+    uint32_t div;           /* Clock divider (INT + FRAC for conversion rate) */
+    uint32_t intr;          /* Raw interrupt status (FIFO) */
+    uint32_t inte;          /* Interrupt enable (FIFO) */
+    uint32_t intf;          /* Interrupt force (FIFO) */
+    
+    /* FIFO: circular buffer of 12-bit samples */
+    uint16_t fifo_data[RP2350_ADC_FIFO_SIZE];  /* 16 entries */
+    int fifo_r, fifo_w;     /* Read/write indices */
+    int fifo_count;         /* Current FIFO level */
+    
+    /* Conversion simulation */
+    QEMUTimer *conv_timer;  /* QEMU timer for simulating conversion delay */
+    RP2350State *parent;    /* Back pointer to parent machine state */
+} RP2350ADCState;
+
+/* DMA Channel state */
+typedef struct RP2350DMAChannelState {
+    uint32_t read_addr;     /* Current read address */
+    uint32_t write_addr;    /* Current write address */
+    uint32_t trans_count;   /* Transfer count + MODE field (bits 31:28) */
+    uint32_t ctrl_trig;     /* Control register (EN, DATA_SIZE, INCR_READ/WRITE, TREQ_SEL, etc) */
+} RP2350DMAChannelState;
+
+/* DMA state */
+typedef struct RP2350DMAState {
+    MemoryRegion iomem;
+    
+    /* 16 DMA channels */
+    RP2350DMAChannelState channel[RP2350_NUM_DMA_CHANNELS];
+    
+    /* Global DMA Interrupt registers */
+    uint32_t intr;          /* Raw interrupt status (16 bits, one per channel) */
+    uint32_t inte0;         /* Interrupt enable for IRQ 0 */
+    uint32_t intf0;         /* Interrupt force for IRQ 0 */
+    uint32_t ints0;         /* Interrupt status for IRQ 0 */
+    
+    /* Back references */
+    RP2350State *parent;
+    RP2350ADCState *adc;    /* Pointer to ADC for DREQ handling */
+} RP2350DMAState;
+
+/* PWM Slice state */
+typedef struct RP2350PWMSliceState {
+    uint32_t csr;           /* Control/Status (EN, PH_CORRECT, A_INV, B_INV, DIVMODE, PH_RET, PH_ADV) */
+    uint32_t div;           /* Clock divider (INT + FRAC) */
+    uint32_t ctr;           /* Counter value */
+    uint32_t cc;            /* Compare values (A and B channels, 16-bit each) */
+    uint32_t top;           /* Wrap/top value */
+} RP2350PWMSliceState;
+
+/* PWM state */
+typedef struct RP2350PWMState {
+    MemoryRegion iomem;
+    
+    /* 12 PWM slices (0-11), each with independent counter */
+    RP2350PWMSliceState slice[RP2350_NUM_PWM_SLICES];
+    
+    /* Global PWM registers */
+    uint32_t en;            /* Global enable for all channels (12 bits) */
+    uint32_t intr;          /* Raw interrupt status (12 bits) */
+    uint32_t inte;          /* Interrupt enable (12 bits, one per slice) */
+    uint32_t intf;          /* Interrupt force */
+    
+    /* Back reference */
+    RP2350State *parent;
+} RP2350PWMState;
+
+/* SPI Wrapper State - handles atomic aliases for PL022 */
+typedef struct RP2350SPIState {
+    MemoryRegion iomem;     /* 16KB region for base + aliases */
+    PL022State *pl022;      /* Underlying PL022 device */
+    int index;              /* SPI instance (0 or 1) */
+} RP2350SPIState;
 
 typedef struct RP2350SIOState {
     MemoryRegion iomem;
@@ -870,6 +980,565 @@ static const MemoryRegionOps rp2350_pads_bank0_ops = {
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
+/* ========== ADC - Analog-to-Digital Converter ========== */
+
+static uint64_t rp2350_adc_read(void *opaque, hwaddr addr, unsigned size)
+{
+    RP2350ADCState *s = opaque;
+    uint64_t val = 0;
+
+    switch (addr) {
+    case 0x00:  /* CS - Control/Status */
+        val = s->cs;
+        break;
+    case 0x04:  /* RESULT - Most recent conversion result (read-only) */
+        val = s->result & 0xfff;
+        break;
+    case 0x08:  /* FCS - FIFO Control/Status */
+        val = s->fcs & ~(0x0f << 16);  /* Clear LEVEL field */
+        val |= (s->fifo_count & 0x0f) << 16;  /* Set LEVEL from current FIFO count */
+        /* Set FULL/EMPTY bits */
+        if (s->fifo_count == 0) {
+            val |= (1 << 8);  /* EMPTY */
+        }
+        if (s->fifo_count >= RP2350_ADC_FIFO_SIZE) {
+            val |= (1 << 9);  /* FULL */
+        }
+        break;
+    case 0x0c:  /* FIFO - FIFO read (pop value) */
+        if (s->fifo_count > 0) {
+            val = s->fifo_data[s->fifo_r];
+            s->fifo_r = (s->fifo_r + 1) % RP2350_ADC_FIFO_SIZE;
+            s->fifo_count--;
+        }
+        break;
+    case 0x10:  /* DIV - Clock divider */
+        val = s->div;
+        break;
+    case 0x14:  /* INTR - Raw interrupt status */
+        val = s->intr & 0x1;
+        break;
+    case 0x18:  /* INTE - Interrupt enable */
+        val = s->inte & 0x1;
+        break;
+    case 0x1c:  /* INTF - Interrupt force */
+        val = s->intf & 0x1;
+        break;
+    case 0x20:  /* INTS - Interrupt status (after masking) */
+        val = ((s->intr & s->inte) | s->intf) & 0x1;
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP,
+                      "rp2350_adc_read: unimplemented offset 0x%"HWADDR_PRIx"\n",
+                      addr);
+    }
+    return val;
+}
+
+static void rp2350_adc_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    RP2350ADCState *s = opaque;
+    val &= UINT32_MAX;
+
+    switch (addr) {
+    case 0x00:  /* CS - Control/Status */
+        s->cs = (s->cs & 0x00000100) | (val & 0x01fff70f);  /* Keep READY bit, update rest */
+        break;
+    case 0x08:  /* FCS - FIFO Control/Status */
+        s->fcs = val & 0x0f0f0f0f;
+        break;
+    case 0x10:  /* DIV - Clock divider */
+        s->div = val & 0x00ffffff;
+        break;
+    case 0x14:  /* INTR - Write-to-clear raw interrupt */
+        s->intr &= ~(val & 0x1);
+        break;
+    case 0x18:  /* INTE - Interrupt enable */
+        s->inte = val & 0x1;
+        break;
+    case 0x1c:  /* INTF - Interrupt force */
+        s->intf = val & 0x1;
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP,
+                      "rp2350_adc_write: unimplemented offset 0x%"HWADDR_PRIx"\n",
+                      addr);
+    }
+}
+
+static const MemoryRegionOps rp2350_adc_ops = {
+    .read = rp2350_adc_read,
+    .write = rp2350_adc_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
+/* ========== DMA - Direct Memory Access ========== */
+
+static uint64_t rp2350_dma_read(void *opaque, hwaddr addr, unsigned size)
+{
+    RP2350DMAState *s = opaque;
+    uint64_t val = 0;
+    
+    /* DMA channel register (addr 0x00-0x2ff for 16 channels, 0x40 bytes each) */
+    int channel_idx = addr / 0x40;
+    int reg_offset = addr % 0x40;
+    
+    if (channel_idx < RP2350_NUM_DMA_CHANNELS) {
+        RP2350DMAChannelState *ch = &s->channel[channel_idx];
+        
+        switch (reg_offset) {
+        case 0x00:  /* READ_ADDR */
+            val = ch->read_addr;
+            break;
+        case 0x04:  /* WRITE_ADDR */
+            val = ch->write_addr;
+            break;
+        case 0x08:  /* TRANS_COUNT */
+            val = ch->trans_count;
+            break;
+        case 0x0c:  /* CTRL_TRIG */
+            val = ch->ctrl_trig;
+            break;
+        default:
+            /* Alias registers - treat as CTRL_TRIG for now */
+            if (reg_offset >= 0x10 && reg_offset < 0x40) {
+                val = ch->ctrl_trig;  /* Simplified: alias behavior */
+            }
+        }
+        return val;
+    }
+    
+    /* Global DMA registers (above channels) */
+    addr -= 0x400;  /* Start of global registers after all channel data */
+    
+    switch (addr) {
+    case 0x00:  /* INTR - Raw interrupt status */
+        val = s->intr & 0xffff;
+        break;
+    case 0x04:  /* INTE0 - Interrupt enable for IRQ 0 */
+        val = s->inte0 & 0xffff;
+        break;
+    case 0x08:  /* INTF0 - Interrupt force */
+        val = s->intf0 & 0xffff;
+        break;
+    case 0x0c:  /* INTS0 - Interrupt status */
+        val = ((s->intr & s->inte0) | s->intf0) & 0xffff;
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP,
+                      "rp2350_dma_read: unimplemented offset 0x%"HWADDR_PRIx"\n",
+                      addr);
+    }
+    
+    return val;
+}
+
+static void rp2350_dma_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    RP2350DMAState *s = opaque;
+    val &= UINT32_MAX;
+    
+    /* DMA channel register */
+    int channel_idx = addr / 0x40;
+    int reg_offset = addr % 0x40;
+    
+    if (channel_idx < RP2350_NUM_DMA_CHANNELS) {
+        RP2350DMAChannelState *ch = &s->channel[channel_idx];
+        
+        switch (reg_offset) {
+        case 0x00:  /* READ_ADDR */
+            ch->read_addr = val;
+            break;
+        case 0x04:  /* WRITE_ADDR */
+            ch->write_addr = val;
+            break;
+        case 0x08:  /* TRANS_COUNT */
+            ch->trans_count = val;
+            break;
+        case 0x0c:  /* CTRL_TRIG */
+            ch->ctrl_trig = val & 0xe7ffffff;
+            /* TODO: Trigger DMA transfer if EN bit set */
+            break;
+        default:
+            /* Alias registers */
+            if (reg_offset >= 0x10 && reg_offset < 0x40) {
+                ch->ctrl_trig = val;  /* Simplified */
+            }
+        }
+        return;
+    }
+    
+    /* Global DMA registers */
+    addr -= 0x400;
+    
+    switch (addr) {
+    case 0x00:  /* INTR - Write-to-clear raw interrupt */
+        s->intr &= ~(val & 0xffff);
+        break;
+    case 0x04:  /* INTE0 - Interrupt enable */
+        s->inte0 = val & 0xffff;
+        break;
+    case 0x08:  /* INTF0 - Interrupt force */
+        s->intf0 = val & 0xffff;
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP,
+                      "rp2350_dma_write: unimplemented offset 0x%"HWADDR_PRIx"\n",
+                      addr);
+    }
+}
+
+static const MemoryRegionOps rp2350_dma_ops = {
+    .read = rp2350_dma_read,
+    .write = rp2350_dma_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
+/* ========== PWM - Pulse Width Modulation ========== */
+
+static uint64_t rp2350_pwm_read(void *opaque, hwaddr addr, unsigned size)
+{
+    RP2350PWMState *s = opaque;
+    uint64_t val = 0;
+    
+    /* Handle atomic register aliases */
+    /* In RP2040/RP2350, registers at base address have atomic aliases at +0x1000/+0x2000/+0x3000 */
+    /* When firmware reads from alias address, we return the base register value */
+    /* The actual read still happens from the base address, aliases only affect writes */
+    hwaddr base_offset = addr & 0xfff;     /* Extract actual register offset [11:0] */
+    
+    /* Reads always return the base register value, regardless of which alias was used */
+    addr = base_offset;
+    
+    /* PWM slice registers (each slice is 0x14 bytes: csr, div, ctr, cc, top) */
+    int slice_idx = addr / 0x14;
+    int reg_offset = addr % 0x14;
+    
+    if (slice_idx < RP2350_NUM_PWM_SLICES) {
+        RP2350PWMSliceState *slice = &s->slice[slice_idx];
+        
+        switch (reg_offset) {
+        case 0x00:  /* CSR - Control/Status */
+            val = slice->csr & 0xff;
+            break;
+        case 0x04:  /* DIV - Clock divider */
+            val = slice->div & 0xfff;
+            break;
+        case 0x08:  /* CTR - Counter */
+            val = slice->ctr & 0xffff;
+            break;
+        case 0x0c:  /* CC - Compare A/B */
+            val = slice->cc;
+            break;
+        case 0x10:  /* TOP - Wrap value */
+            val = slice->top & 0xffff;
+            break;
+        default:
+            /* Unimplemented registers */
+            break;
+        }
+        return val;
+    }
+    
+    /* Global PWM interrupt registers at fixed addresses */
+    /* (RP2350 has EN register at 0xf0, INTR at 0xf4, then IRQ0 regs) */
+    switch (addr) {
+    case 0x0f0:  /* EN - global enable for all channels */
+        val = s->en & 0xfff;
+        break;
+    case 0x0f4:  /* INTR - Raw interrupt status */
+        val = s->intr & 0xfff;
+        break;
+    case 0x0f8:  /* IRQ0_INTE - Interrupt enable */
+        val = s->inte & 0xfff;
+        break;
+    case 0x0fc:  /* IRQ0_INTF - Interrupt force */
+        val = s->intf & 0xfff;
+        break;
+    case 0x100:  /* IRQ0_INTS - Interrupt status */
+        val = ((s->intr & s->inte) | s->intf) & 0xfff;
+        break;
+    default:
+        break;
+    }
+    
+    return val;
+}
+
+static void rp2350_pwm_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    RP2350PWMState *s = opaque;
+    val &= UINT32_MAX;
+    
+    /* Extract the alias type from the upper address bits (RP2040 alias scheme) */
+    /* Aliases: RW (0x0000), XOR (0x1000), SET (0x2000), CLR (0x3000) */
+    int alias_type = (addr >> 12) & 0x3;  /* Bits 13:12 select the alias */
+    hwaddr base_addr = addr & 0xfff;      /* Bits 11:0 are the actual register address */
+    
+    /* Base address is where we actually read/write */
+    addr = base_addr;
+    
+    /* PWM slice registers (each slice is 0x14 bytes) */
+    int slice_idx = addr / 0x14;
+    int reg_offset = addr % 0x14;
+    
+    if (slice_idx < RP2350_NUM_PWM_SLICES) {
+        RP2350PWMSliceState *slice = &s->slice[slice_idx];
+        uint32_t old_val;
+        
+        switch (reg_offset) {
+        case 0x00:  /* CSR - Control/Status */
+            old_val = slice->csr;
+            switch (alias_type) {
+            case 0:  /* RW - Normal write */
+                slice->csr = val & 0xff;
+                break;
+            case 1:  /* XOR - Toggle bits */
+                slice->csr = (old_val ^ val) & 0xff;
+                break;
+            case 2:  /* SET - Set bits (OR) */
+                slice->csr = (old_val | val) & 0xff;
+                break;
+            case 3:  /* CLR - Clear bits (AND NOT) */
+                slice->csr = (old_val & ~val) & 0xff;
+                break;
+            }
+            break;
+        case 0x04:  /* DIV - Clock divider */
+            old_val = slice->div;
+            switch (alias_type) {
+            case 0:  /* RW - Normal write */
+                slice->div = val & 0xfff;
+                break;
+            case 1:  /* XOR - Toggle bits */
+                slice->div = (old_val ^ val) & 0xfff;
+                break;
+            case 2:  /* SET - Set bits (OR) */
+                slice->div = (old_val | val) & 0xfff;
+                break;
+            case 3:  /* CLR - Clear bits (AND NOT) */
+                slice->div = (old_val & ~val) & 0xfff;
+                break;
+            }
+            break;
+        case 0x08:  /* CTR - Counter */
+            old_val = slice->ctr;
+            switch (alias_type) {
+            case 0:  /* RW - Normal write */
+                slice->ctr = val & 0xffff;
+                break;
+            case 1:  /* XOR - Toggle bits */
+                slice->ctr = (old_val ^ val) & 0xffff;
+                break;
+            case 2:  /* SET - Set bits (OR) */
+                slice->ctr = (old_val | val) & 0xffff;
+                break;
+            case 3:  /* CLR - Clear bits (AND NOT) */
+                slice->ctr = (old_val & ~val) & 0xffff;
+                break;
+            }
+            break;
+        case 0x0c:  /* CC - Compare A/B */
+            old_val = slice->cc;
+            switch (alias_type) {
+            case 0:  /* RW - Normal write */
+                slice->cc = val;
+                break;
+            case 1:  /* XOR - Toggle bits */
+                slice->cc = old_val ^ val;
+                break;
+            case 2:  /* SET - Set bits (OR) */
+                slice->cc = old_val | val;
+                break;
+            case 3:  /* CLR - Clear bits (AND NOT) */
+                slice->cc = old_val & ~val;
+                break;
+            }
+            break;
+        case 0x10:  /* TOP - Wrap value */
+            old_val = slice->top;
+            switch (alias_type) {
+            case 0:  /* RW - Normal write */
+                slice->top = val & 0xffff;
+                break;
+            case 1:  /* XOR - Toggle bits */
+                slice->top = (old_val ^ val) & 0xffff;
+                break;
+            case 2:  /* SET - Set bits (OR) */
+                slice->top = (old_val | val) & 0xffff;
+                break;
+            case 3:  /* CLR - Clear bits (AND NOT) */
+                slice->top = (old_val & ~val) & 0xffff;
+                break;
+            }
+            break;
+        default:
+            break;
+        }
+        return;
+    }
+    
+    /* Global PWM registers at fixed addresses */
+    switch (addr) {
+    case 0x0f0:  /* EN - global enable for all channels */
+        switch (alias_type) {
+        case 0:  s->en = val & 0xfff; break;
+        case 1:  s->en = (s->en ^ val) & 0xfff; break;
+        case 2:  s->en = (s->en | val) & 0xfff; break;
+        case 3:  s->en = (s->en & ~val) & 0xfff; break;
+        }
+        break;
+    case 0x0f4:  /* INTR - Write-to-clear raw interrupt */
+        s->intr &= ~(val & 0xfff);
+        break;
+    case 0x0f8:  /* IRQ0_INTE - Interrupt enable */
+        switch (alias_type) {
+        case 0:  s->inte = val & 0xfff; break;
+        case 1:  s->inte = (s->inte ^ val) & 0xfff; break;
+        case 2:  s->inte = (s->inte | val) & 0xfff; break;
+        case 3:  s->inte = (s->inte & ~val) & 0xfff; break;
+        }
+        break;
+    case 0x0fc:  /* IRQ0_INTF - Interrupt force */
+        switch (alias_type) {
+        case 0:  s->intf = val & 0xfff; break;
+        case 1:  s->intf = (s->intf ^ val) & 0xfff; break;
+        case 2:  s->intf = (s->intf | val) & 0xfff; break;
+        case 3:  s->intf = (s->intf & ~val) & 0xfff; break;
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static const MemoryRegionOps rp2350_pwm_ops = {
+    .read = rp2350_pwm_read,
+    .write = rp2350_pwm_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
+/* ========== SPI - Synchronous Serial Port (PL022 wrapper with atomic aliases) ========== */
+/* RP2350 uses PL022 SSP devices. We need a wrapper to handle atomic register aliases
+ * (XOR/SET/CLR) since the Pico SDK uses hw_set_bits/hw_clear_bits for SPI init. */
+
+/* PL022 register offsets */
+#define PL022_CR0       0x00
+#define PL022_CR1       0x04
+#define PL022_DR        0x08
+#define PL022_SR        0x0c
+#define PL022_CPSR      0x10
+#define PL022_IMSC      0x14
+#define PL022_RIS       0x18
+#define PL022_MIS       0x1c
+#define PL022_ICR       0x20
+#define PL022_DMACR     0x24
+
+/* We maintain shadow copies of writable registers for atomic alias support */
+typedef struct RP2350SPIRegs {
+    uint32_t cr0;
+    uint32_t cr1;
+    uint32_t cpsr;
+    uint32_t imsc;
+    uint32_t dmacr;
+} RP2350SPIRegs;
+
+static RP2350SPIRegs spi_shadow[2];  /* Shadow registers for SPI0 and SPI1 */
+
+static uint64_t rp2350_spi_read(void *opaque, hwaddr addr, unsigned size)
+{
+    RP2350SPIState *s = (RP2350SPIState *)opaque;
+    hwaddr base_offset = addr & 0xfff;  /* Strip alias bits */
+    RP2350SPIRegs *regs = &spi_shadow[s->index];
+    uint64_t val = 0;
+    MemOp op = MO_32;
+
+    /* For reads, always return from shadow registers (which stay in sync with PL022) */
+    switch (base_offset) {
+    case PL022_CR0:
+        return regs->cr0;
+    case PL022_CR1:
+        return regs->cr1;
+    case PL022_CPSR:
+        return regs->cpsr;
+    case PL022_IMSC:
+        return regs->imsc;
+    case PL022_DMACR:
+        return regs->dmacr;
+    default:
+        /* For other registers (DR, SR, RIS, MIS, etc.), read directly from PL022 */
+        memory_region_dispatch_read(&s->pl022->iomem, base_offset,
+                                   &val, op, MEMTXATTRS_UNSPECIFIED);
+        return val;
+    }
+}
+
+static void rp2350_spi_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    RP2350SPIState *s = (RP2350SPIState *)opaque;
+    int alias_type = (addr >> 12) & 0x3;  /* Bits 13:12: 0=RW, 1=XOR, 2=SET, 3=CLR */
+    hwaddr base_offset = addr & 0xfff;
+    RP2350SPIRegs *regs = &spi_shadow[s->index];
+    uint32_t *shadow_reg = NULL;
+    uint32_t new_val;
+
+    /* Determine which shadow register to use */
+    switch (base_offset) {
+    case PL022_CR0:
+        shadow_reg = &regs->cr0;
+        break;
+    case PL022_CR1:
+        shadow_reg = &regs->cr1;
+        break;
+    case PL022_CPSR:
+        shadow_reg = &regs->cpsr;
+        break;
+    case PL022_IMSC:
+        shadow_reg = &regs->imsc;
+        break;
+    case PL022_DMACR:
+        shadow_reg = &regs->dmacr;
+        break;
+    default:
+        /* For other registers (DR, ICR), write directly to PL022 */
+        memory_region_dispatch_write(&s->pl022->iomem, base_offset,
+                                     val, MO_32, MEMTXATTRS_UNSPECIFIED);
+        return;
+    }
+
+    /* Apply atomic operation based on alias type */
+    switch (alias_type) {
+    case 0:  /* Normal write */
+        new_val = val;
+        break;
+    case 1:  /* XOR */
+        new_val = *shadow_reg ^ val;
+        break;
+    case 2:  /* SET (OR) */
+        new_val = *shadow_reg | val;
+        break;
+    case 3:  /* CLR (AND NOT) */
+        new_val = *shadow_reg & ~val;
+        break;
+    default:
+        new_val = val;
+        break;
+    }
+
+    /* Update shadow register */
+    *shadow_reg = new_val;
+
+    /* Write to underlying PL022 device */
+    memory_region_dispatch_write(&s->pl022->iomem, base_offset,
+                                 new_val, MO_32, MEMTXATTRS_UNSPECIFIED);
+}
+
+static const MemoryRegionOps rp2350_spi_ops = {
+    .read = rp2350_spi_read,
+    .write = rp2350_spi_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
 /* ========== TIMER - Microsecond Timer (struct only) ========== */
 typedef struct RP2350TimerState RP2350TimerState;
 typedef struct RP2350State RP2350State;
@@ -910,6 +1579,13 @@ struct RP2350State {
     RP2350PadsBank0State pads_bank0;
     RP2350TimerState timer0;
     RP2350TimerState timer1;
+    RP2350ADCState adc;
+    RP2350DMAState dma;
+    RP2350PWMState pwm;
+    
+    /* SPI peripherals (PL022 with atomic alias wrapper) */
+    RP2350SPIState spi[2];
+    
     /* Per-core board memory view (aliases system memory) for ARMv7M devices */
     MemoryRegion board_mem[RP2350_CPUS];
 
@@ -1657,6 +2333,75 @@ static void rp2350_init(MachineState *machine)
                           &s->timer1, "rp2350.timer1", RP2350_TIMER_SIZE);
     memory_region_add_subregion(get_system_memory(), RP2350_TIMER1_BASE,
                                 &s->timer1.iomem);
+
+    /* ADC - Analog-to-Digital Converter */
+    memset(&s->adc, 0, sizeof(RP2350ADCState));
+    s->adc.parent = s;
+    s->adc.fifo_r = s->adc.fifo_w = s->adc.fifo_count = 0;
+    /* ADC starts with READY bit set */
+    s->adc.cs |= (1 << 8);  /* READY */
+    memory_region_init_io(&s->adc.iomem, OBJECT(machine), &rp2350_adc_ops,
+                          &s->adc, "rp2350.adc", RP2350_ADC_SIZE);
+    memory_region_add_subregion(get_system_memory(), RP2350_ADC_BASE,
+                                &s->adc.iomem);
+
+    /* DMA - Direct Memory Access */
+    memset(&s->dma, 0, sizeof(RP2350DMAState));
+    s->dma.parent = s;
+    s->dma.adc = &s->adc;  /* Connect ADC for DREQ handling */
+    for (int i = 0; i < RP2350_NUM_DMA_CHANNELS; i++) {
+        s->dma.channel[i].read_addr = 0;
+        s->dma.channel[i].write_addr = 0;
+        s->dma.channel[i].trans_count = 0;
+        s->dma.channel[i].ctrl_trig = 0;
+    }
+    memory_region_init_io(&s->dma.iomem, OBJECT(machine), &rp2350_dma_ops,
+                          &s->dma, "rp2350.dma", RP2350_DMA_SIZE);
+    memory_region_add_subregion(get_system_memory(), RP2350_DMA_BASE,
+                                &s->dma.iomem);
+
+    /* PWM - Pulse Width Modulation */
+    memset(&s->pwm, 0, sizeof(RP2350PWMState));
+    s->pwm.parent = s;
+    for (int i = 0; i < RP2350_NUM_PWM_SLICES; i++) {
+        s->pwm.slice[i].csr = 0;
+        s->pwm.slice[i].div = (1 << 4);  /* Default divider = 1 */
+        s->pwm.slice[i].ctr = 0;
+        s->pwm.slice[i].cc = 0;
+        s->pwm.slice[i].top = 0xffff;  /* Default top = 65535 */
+    }
+    s->pwm.inte = 0;
+    s->pwm.intf = 0;
+    s->pwm.intr = 0;
+    memory_region_init_io(&s->pwm.iomem, OBJECT(machine), &rp2350_pwm_ops,
+                          &s->pwm, "rp2350.pwm", RP2350_PWM_SIZE);
+    memory_region_add_subregion(get_system_memory(), RP2350_PWM_BASE,
+                                &s->pwm.iomem);
+
+    /* SPI0 - PL022 Synchronous Serial Port with atomic alias wrapper */
+    s->spi[0].pl022 = PL022(qdev_new(TYPE_PL022));
+    s->spi[0].index = 0;
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(s->spi[0].pl022), &error_fatal);
+    /* Don't use sysbus_mmio_map - we wrap PL022 with our own region for atomic aliases */
+    memset(&spi_shadow[0], 0, sizeof(RP2350SPIRegs));
+    memory_region_init_io(&s->spi[0].iomem, OBJECT(machine), &rp2350_spi_ops,
+                          &s->spi[0], "rp2350.spi0", RP2350_SPI_SIZE);
+    memory_region_add_subregion(get_system_memory(), RP2350_SPI0_BASE,
+                                &s->spi[0].iomem);
+    sysbus_connect_irq(SYS_BUS_DEVICE(s->spi[0].pl022), 0,
+                       qdev_get_gpio_in(DEVICE(&s->cpu[0]), RP2350_SPI0_IRQ));
+
+    /* SPI1 - PL022 Synchronous Serial Port with atomic alias wrapper */
+    s->spi[1].pl022 = PL022(qdev_new(TYPE_PL022));
+    s->spi[1].index = 1;
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(s->spi[1].pl022), &error_fatal);
+    memset(&spi_shadow[1], 0, sizeof(RP2350SPIRegs));
+    memory_region_init_io(&s->spi[1].iomem, OBJECT(machine), &rp2350_spi_ops,
+                          &s->spi[1], "rp2350.spi1", RP2350_SPI_SIZE);
+    memory_region_add_subregion(get_system_memory(), RP2350_SPI1_BASE,
+                                &s->spi[1].iomem);
+    sysbus_connect_irq(SYS_BUS_DEVICE(s->spi[1].pl022), 0,
+                       qdev_get_gpio_in(DEVICE(&s->cpu[0]), RP2350_SPI1_IRQ));
 
     /* 4. Unimplemented Devices */
     /*
