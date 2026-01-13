@@ -34,7 +34,7 @@
 #include "qemu/option.h"
 #include "qemu/target-info.h"
 #include "monitor/qdev.h"
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "hw/arm/boot.h"
 #include "hw/arm/primecell.h"
 #include "hw/arm/virt.h"
@@ -51,7 +51,7 @@
 #include "system/hvf.h"
 #include "system/qtest.h"
 #include "system/system.h"
-#include "hw/loader.h"
+#include "hw/core/loader.h"
 #include "qapi/error.h"
 #include "qemu/bitops.h"
 #include "qemu/cutils.h"
@@ -62,13 +62,13 @@
 #include "hw/pci-bridge/pci_expander_bridge.h"
 #include "hw/virtio/virtio-pci.h"
 #include "hw/core/sysbus-fdt.h"
-#include "hw/platform-bus.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/platform-bus.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/arm/fdt.h"
 #include "hw/intc/arm_gic.h"
 #include "hw/intc/arm_gicv3_common.h"
 #include "hw/intc/arm_gicv3_its_common.h"
-#include "hw/irq.h"
+#include "hw/core/irq.h"
 #include "kvm_arm.h"
 #include "hvf_arm.h"
 #include "hw/firmware/smbios.h"
@@ -3533,10 +3533,17 @@ static void machvirt_machine_init(void)
 }
 type_init(machvirt_machine_init);
 
-static void virt_machine_10_2_options(MachineClass *mc)
+static void virt_machine_11_0_options(MachineClass *mc)
 {
 }
-DEFINE_VIRT_MACHINE_AS_LATEST(10, 2)
+DEFINE_VIRT_MACHINE_AS_LATEST(11, 0)
+
+static void virt_machine_10_2_options(MachineClass *mc)
+{
+    virt_machine_11_0_options(mc);
+    compat_props_add(mc->compat_props, hw_compat_10_2, hw_compat_10_2_len);
+}
+DEFINE_VIRT_MACHINE(10, 2)
 
 static void virt_machine_10_1_options(MachineClass *mc)
 {
