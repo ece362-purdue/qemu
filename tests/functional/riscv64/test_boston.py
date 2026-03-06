@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 #
-# Boston board test for RISC-V P8700 processor by MIPS
-#
 # Copyright (c) 2025 MIPS
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
+"""
+Boston board test for RISC-V P8700 processor by MIPS
+"""
+
+from subprocess import run
 
 from qemu_test import QemuSystemTest, Asset
 from qemu_test import wait_for_console_pattern
@@ -63,25 +66,6 @@ class RiscvBostonTest(QemuSystemTest):
         """
         self._boot_linux_test(smp_count=2)
 
-    def test_boston_boot_linux_7_cpus(self):
-        """
-        Test Linux kernel boot with 7 CPUs
-
-        7 CPUs is a special configuration that tests odd CPU count
-        handling and ensures proper core distribution across clusters.
-        """
-        self._boot_linux_test(smp_count=7)
-
-    def test_boston_boot_linux_35_cpus(self):
-        """
-        Test Linux kernel boot with 35 CPUs
-
-        35 CPUs is a special configuration that tests a non-power-of-2
-        CPU count above 32, validating proper handling of larger
-        asymmetric SMP configurations.
-        """
-        self._boot_linux_test(smp_count=35)
-
     def test_boston_boot_linux_max_cpus(self):
         """
         Test Linux kernel boot with maximum supported CPU count (64)
@@ -92,7 +76,6 @@ class RiscvBostonTest(QemuSystemTest):
         """
         Test that 65 CPUs is rejected as invalid (negative test case)
         """
-        from subprocess import run, PIPE
 
         fw_payload_path = self.ASSET_FW_PAYLOAD.fetch()
         rootfs_path = self.ASSET_ROOTFS.fetch()
@@ -109,7 +92,8 @@ class RiscvBostonTest(QemuSystemTest):
         ]
 
         # Run QEMU and expect it to fail immediately.
-        result = run(cmd, capture_output=True, text=True, timeout=5)
+        result = run(cmd, capture_output=True, text=True, timeout=5,
+                     check=False)
 
         # Check that QEMU exited with error code 1
         self.assertEqual(result.returncode, 1,

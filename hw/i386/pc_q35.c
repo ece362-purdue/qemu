@@ -328,16 +328,6 @@ static void pc_q35_init(MachineState *machine)
                                x86_nvdimm_acpi_dsmio,
                                x86ms->fw_cfg, OBJECT(pcms));
     }
-
-#if defined(CONFIG_IGVM)
-    /* Apply guest state from IGVM if supplied */
-    if (x86ms->igvm) {
-        if (IGVM_CFG_GET_CLASS(x86ms->igvm)
-                ->process(x86ms->igvm, machine->cgs, false, &error_fatal) < 0) {
-            g_assert_not_reached();
-        }
-    }
-#endif
 }
 
 #define DEFINE_Q35_MACHINE(major, minor) \
@@ -633,74 +623,3 @@ static void pc_q35_machine_3_0_options(MachineClass *m)
 }
 
 DEFINE_Q35_MACHINE(3, 0);
-
-static void pc_q35_machine_2_12_options(MachineClass *m)
-{
-    pc_q35_machine_3_0_options(m);
-    compat_props_add(m->compat_props, hw_compat_2_12, hw_compat_2_12_len);
-    compat_props_add(m->compat_props, pc_compat_2_12, pc_compat_2_12_len);
-}
-
-DEFINE_Q35_MACHINE(2, 12);
-
-static void pc_q35_machine_2_11_options(MachineClass *m)
-{
-    pc_q35_machine_2_12_options(m);
-    m->default_nic = "e1000";
-    compat_props_add(m->compat_props, hw_compat_2_11, hw_compat_2_11_len);
-    compat_props_add(m->compat_props, pc_compat_2_11, pc_compat_2_11_len);
-}
-
-DEFINE_Q35_MACHINE(2, 11);
-
-static void pc_q35_machine_2_10_options(MachineClass *m)
-{
-    pc_q35_machine_2_11_options(m);
-    compat_props_add(m->compat_props, hw_compat_2_10, hw_compat_2_10_len);
-    compat_props_add(m->compat_props, pc_compat_2_10, pc_compat_2_10_len);
-    m->auto_enable_numa_with_memhp = false;
-}
-
-DEFINE_Q35_MACHINE(2, 10);
-
-static void pc_q35_machine_2_9_options(MachineClass *m)
-{
-    pc_q35_machine_2_10_options(m);
-    compat_props_add(m->compat_props, hw_compat_2_9, hw_compat_2_9_len);
-    compat_props_add(m->compat_props, pc_compat_2_9, pc_compat_2_9_len);
-}
-
-DEFINE_Q35_MACHINE(2, 9);
-
-static void pc_q35_machine_2_8_options(MachineClass *m)
-{
-    pc_q35_machine_2_9_options(m);
-    compat_props_add(m->compat_props, hw_compat_2_8, hw_compat_2_8_len);
-    compat_props_add(m->compat_props, pc_compat_2_8, pc_compat_2_8_len);
-}
-
-DEFINE_Q35_MACHINE(2, 8);
-
-static void pc_q35_machine_2_7_options(MachineClass *m)
-{
-    pc_q35_machine_2_8_options(m);
-    m->max_cpus = 255;
-    compat_props_add(m->compat_props, hw_compat_2_7, hw_compat_2_7_len);
-    compat_props_add(m->compat_props, pc_compat_2_7, pc_compat_2_7_len);
-}
-
-DEFINE_Q35_MACHINE(2, 7);
-
-static void pc_q35_machine_2_6_options(MachineClass *m)
-{
-    X86MachineClass *x86mc = X86_MACHINE_CLASS(m);
-    PCMachineClass *pcmc = PC_MACHINE_CLASS(m);
-
-    pc_q35_machine_2_7_options(m);
-    pcmc->legacy_cpu_hotplug = true;
-    x86mc->fwcfg_dma_enabled = false;
-    compat_props_add(m->compat_props, hw_compat_2_6, hw_compat_2_6_len);
-    compat_props_add(m->compat_props, pc_compat_2_6, pc_compat_2_6_len);
-}
-
-DEFINE_Q35_MACHINE(2, 6);

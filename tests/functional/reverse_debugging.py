@@ -67,13 +67,12 @@ class ReverseDebugging(LinuxKernelTest):
     def reverse_debugging(self, gdb_arch, shift=7, args=None, big_endian=False):
         from qemu_test import GDB
 
+        self.require_accelerator("tcg")
+
         # create qcow2 for snapshots
         self.log.info('creating qcow2 image for VM snapshots')
         image_path = os.path.join(self.workdir, 'disk.qcow2')
         qemu_img = get_qemu_img(self)
-        if qemu_img is None:
-            self.skipTest('Could not find "qemu-img", which is required to '
-                          'create the temporary qcow2 image')
         out = check_output([qemu_img, 'create', '-f', 'qcow2', image_path, '128M'],
                            encoding='utf8')
         self.log.info("qemu-img: %s" % out)

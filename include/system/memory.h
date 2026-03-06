@@ -27,9 +27,11 @@
 #include "qemu/rcu.h"
 
 enum device_endian {
-    DEVICE_NATIVE_ENDIAN,
-    DEVICE_BIG_ENDIAN,
-    DEVICE_LITTLE_ENDIAN,
+#ifndef TARGET_NOT_USING_LEGACY_NATIVE_ENDIAN_API
+    DEVICE_NATIVE_ENDIAN = 0,
+#endif
+    DEVICE_BIG_ENDIAN = 1,
+    DEVICE_LITTLE_ENDIAN = 2,
 };
 
 #define RAM_ADDR_INVALID (~(ram_addr_t)0)
@@ -1611,33 +1613,6 @@ bool memory_region_init_rom_nomigrate(MemoryRegion *mr,
                                       const char *name,
                                       uint64_t size,
                                       Error **errp);
-
-/**
- * memory_region_init_rom_device_nomigrate:  Initialize a ROM memory region.
- *                                 Writes are handled via callbacks.
- *
- * Note that this function does not do anything to cause the data in the
- * RAM side of the memory region to be migrated; that is the responsibility
- * of the caller.
- *
- * @mr: the #MemoryRegion to be initialized.
- * @owner: the object that tracks the region's reference count
- * @ops: callbacks for write access handling (must not be NULL).
- * @opaque: passed to the read and write callbacks of the @ops structure.
- * @name: Region name, becomes part of RAMBlock name used in migration stream
- *        must be unique within any device
- * @size: size of the region.
- * @errp: pointer to Error*, to store an error if it happens.
- *
- * Return: true on success, else false setting @errp with error.
- */
-bool memory_region_init_rom_device_nomigrate(MemoryRegion *mr,
-                                             Object *owner,
-                                             const MemoryRegionOps *ops,
-                                             void *opaque,
-                                             const char *name,
-                                             uint64_t size,
-                                             Error **errp);
 
 /**
  * memory_region_init_iommu: Initialize a memory region of a custom type

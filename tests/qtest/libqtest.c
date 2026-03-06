@@ -1042,7 +1042,6 @@ static bool qtest_qom_has_concrete_type(const char *parent_typename,
     QObject *qobj;
     QString *qstr;
     QDict *devinfo;
-    int idx;
 
     if (!list) {
         QDict *resp;
@@ -1067,7 +1066,7 @@ static bool qtest_qom_has_concrete_type(const char *parent_typename,
         }
     }
 
-    for (p = qlist_first(list), idx = 0; p; p = qlist_next(p), idx++) {
+    for (p = qlist_first(list); p; p = qlist_next(p)) {
         devinfo = qobject_to(QDict, qlist_entry_obj(p));
         g_assert(devinfo);
 
@@ -1816,6 +1815,7 @@ void qtest_cb_for_every_machine(void (*cb)(const char *machine),
             g_str_equal("xenpv", machines[i].name) ||
             g_str_equal("xenpvh", machines[i].name) ||
             g_str_equal("vmapple", machines[i].name) ||
+            g_str_equal("nitro", machines[i].name) ||
             g_str_equal("nitro-enclave", machines[i].name)) {
             continue;
         }
